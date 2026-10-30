@@ -1858,6 +1858,172 @@ class DeniaSharePlugin(Star):
             nodes.nodes.append(_node(item))
         return event.chain_result([nodes])
 
+    # ==================== Markdown 图片集中展示 ====================
+
+    @staticmethod
+    def _collect_markdown_images(result: ParseResult) -> list[ImageContent]:
+        """收集结果里所有**带公网 URL** 的图片，按展示顺序返回 ``ImageContent``。
+
+        图片在 ``contents``（``img_contents``）和 ``graphics`` 里都可能出现，
+        两种都要收；``repost`` 只递归一层（转发帖不会自己再套一层转发）。
+
+        没有 URL 的图片（外部直接塞 Task 的构造方式）无法用 Markdown 渲染，
+        这里直接跳过 —— 调用方据返回值数量决定是否值得走 Markdown。
+        """
+        images: list[ImageContent] = []
+
+        for image in result.img_contents:
+            if image.url:
+                images.append(image)
+
+        for graphic in result.graphics:
+            if isinstance(graphic, ImageContent) and graphic.url:
+                images.append(graphic)
+
+        if result.repost is not None:
+            images.extend(DeniaSharePlugin._collect_markdown_images(result.repost))
+
+        return images
+
+    @staticmethod
+    async def _probe_image_size(image: ImageContent) -> tuple[int, int] | None:
+        """读本地已落盘图片的真实宽高，拿不到返回 ``None``。
+
+        这里只读本地文件：图片在发送前的媒体审计里已经下载过，所以是一次
+        纯磁盘读取，不发网络请求。文件不在或不是图片时返回 ``None``，
+        调用方回退到配置的固定宽高，不影响发送。
+        """
+        try:
+            path = await image.path_task.safe_get()
+        except Exception:
+            return None
+        if path is None:
+            return None
+        try:
+            from PIL import Image as PILImage
+
+            with PILImage.open(path) as img:
+                return img.size
+        except Exception:
+            return None
+
+    async def _resolve_markdown_size(self, image: ImageContent) -> tuple[int, int]:
+        """算出这张图该用的 ``(宽, 高)``。
+
+        ``auto``（默认）：按原图比例算高度，**不拉伸不变形**；高度超过上限
+        时改为压宽度、高度封顶，比例依然不变。
+        ``fixed``：直接用配置的宽高（旧行为，竖图会被压扁）。
+        探测失败时回退配置值，保证至少能显示。
+        """
+        pconfig = get_config()
+        width = pconfig.MARKDOWN_IMAGE_WIDTH
+        max_height = pconfig.MARKDOWN_IMAGE_HEIGHT
+        if pconfig.MARKDOWN_IMAGE_SIZE_MODE != "auto":
+            return width, max_height
+
+        size = await self._probe_image_size(image)
+        if not size:
+            return width, max_height
+        orig_w, orig_h = size
+        if orig_w <= 0 or orig_h <= 0:
+            return width, max_height
+
+        height = round(width * orig_h / orig_w)
+        if height > max_height:
+            height = max_height
+            width = max(50, round(max_height * orig_w / orig_h))
+        return max(50, width), max(50, height)
+
+    async def _build_markdown_messages(
+        self,
+        result: ParseResult,
+        images: list[ImageContent],
+    ) -> list[str]:
+        """把图片列表组装成若干条 Markdown 文本。
+
+        - 第一段带平台/作者/标题头信息，后续消息不再重复
+        - 每行 ``MARKDOWN_IMAGE_PER_ROW`` 张，行内用空格分隔实现并排
+        - 超过 ``MARKDOWN_IMAGE_MAX_PER_MSG`` 时按顺序切分，不重不漏
+        """
+        pconfig = get_config()
+        per_msg = pconfig.MARKDOWN_IMAGE_MAX_PER_MSG
+        per_row = pconfig.MARKDOWN_IMAGE_PER_ROW
+
+        header = result.platform.display_name if result.platform else ""
+        if result.author:
+            header += f" @{result.author.name}"
+        if result.title:
+            header += f" | {result.title}"
+
+        messages: list[str] = []
+        for offset in range(0, len(images), per_msg):
+            chunk = images[offset : offset + per_msg]
+            lines: list[str] = []
+            if offset == 0 and header:
+                lines.append(header)
+
+            for row_start in range(0, len(chunk), per_row):
+                row = chunk[row_start : row_start + per_row]
+                cells: list[str] = []
+                for idx, image in enumerate(row, start=offset + row_start + 1):
+                    url = image.url
+                    # alt 里的方括号会提前闭合 Markdown 图片语法，换成全角
+                    label = (image.alt or f"图片 {idx}")
+                    label = label.replace("[", "（").replace("]", "）")
+                    label = label.replace("\n", " ").strip() or f"图片 {idx}"
+                    width, height = await self._resolve_markdown_size(image)
+                    # QQ 官方机器人要求 Markdown 图片带 `#宽px #高px`，
+                    # 缺了这段 QQ 只会把 "[图片 1]" 当成链接文字渲染，
+                    # 群里看到的就是一堆 "[image]"，图片根本不出来。
+                    cells.append(
+                        f"![{label} #{width}px #{height}px]({url})"
+                    )
+                lines.append(" ".join(cells))
+
+            messages.append("\n\n".join(lines))
+
+        return messages
+
+    async def _send_markdown_media(
+        self,
+        event: AstrMessageEvent,
+        result: ParseResult,
+        images: list[ImageContent],
+    ) -> bool:
+        """用 Markdown 消息集中发送图片，返回是否至少成功发出一条。
+
+        走 ``event.send`` 主动发送而不是 yield：只有这样才能拿到发送回执，
+        失败时由调用方回退到合并转发 / 逐条发送，不至于整组图丢掉。
+        """
+        messages = await self._build_markdown_messages(result, images)
+        if not messages:
+            return False
+
+        sent_any = False
+        for index, text in enumerate(messages, start=1):
+            chain = MessageChain(chain=[Comp.Plain(text)])
+            # 兼容不同 AstrBot 版本：方法优先，其次直接写属性
+            if hasattr(chain, "use_markdown"):
+                chain.use_markdown(True)
+            else:
+                chain.use_markdown_ = True
+            try:
+                ok = await event.send(chain)
+            except Exception:
+                logger.warning(
+                    f"[denia_share] Markdown 图片发送异常（第 {index}/{len(messages)} 条）",
+                    exc_info=True,
+                )
+                return sent_any
+            if ok is False:
+                logger.warning(
+                    f"[denia_share] Markdown 图片未送达（第 {index}/{len(messages)} 条）"
+                )
+                return sent_any
+            sent_any = True
+
+        return sent_any
+
     async def _build_output(self, result: ParseResult) -> tuple[str, list[list]]:
         """统一构建 (标题头, 内容节点列表)。
 
@@ -1940,6 +2106,29 @@ class DeniaSharePlugin(Star):
         pconfig = get_config()
         # 每条媒体链路开始前先清标记：上一次「送达未知」不能继承到下一条链接。
         _DELIVERY_UNCERTAIN.set(False)
+
+        # ---- Markdown 集中展示（优先于合并转发，且不依赖 OneBot）----
+        # 合并转发只有 OneBot 支持，而 Markdown 恰好是 QQ 官方机器人能渲染
+        # 图片的通道，所以这一段刻意放在 _is_onebot 判断之前。
+        markdown_images = self._collect_markdown_images(result)
+        if pconfig.should_send_markdown_images(len(markdown_images)):
+            delivered = False
+            try:
+                delivered = await self._send_markdown_media(event, result, markdown_images)
+            except Exception:
+                logger.warning(
+                    "[denia_share] Markdown 图片展示异常，回退原有媒体发送路径",
+                    exc_info=True,
+                )
+            if delivered:
+                if on_delivered is not None:
+                    on_delivered()
+                # 语音、文件、视频不受 Markdown 影响，仍按原规则单独发
+                async for parts in self._iter_media_components(result, skip_images=True):
+                    yield event.chain_result(parts)
+                return
+            logger.info("[denia_share] Markdown 图片未送达，回退到原有媒体发送路径")
+
         if not self._is_onebot(event) or pconfig.AGGREGATION_MODE == "none":
             async for parts in self._iter_media_components(result):
                 yield event.chain_result(parts)
@@ -1986,12 +2175,15 @@ class DeniaSharePlugin(Star):
             if not all(isinstance(part, (Comp.Image, Comp.Video)) for part in parts):
                 yield event.chain_result(parts)
 
-    async def _iter_media_components(self, result: ParseResult):
+    async def _iter_media_components(self, result: ParseResult, *, skip_images: bool = False):
         """构建原始媒体组件，复用下载、缓存和中转规则。
 
         旧实现里图片是塞进文本节点的（``_build_output``），而精简文本按设计
         **只含标题/地址/播放信息**，所以图片必须在这里显式发出去 —— 否则
         关掉文本就等于把图集弄丢了。卡片图片走 ``_send_image``，与这里无关。
+
+        ``skip_images`` 供 Markdown 展示路径使用：图片已经由 Markdown 消息
+        发出去了，这里只补发语音、文件、视频等非图片媒体，避免同一张图发两遍。
 
         **视频为什么需要特殊处理**：AstrBot 把 ``Video`` 段的 ``file:///...``
         原样交给协议端（图片 / 语音会先转成 base64，所以没这个问题），
@@ -2007,24 +2199,27 @@ class DeniaSharePlugin(Star):
         ttl = pconfig.MEDIA_RELAY_TTL
 
         # 图片在 contents 里（contents/graphics 混排的平台两种都有），逐个发
-        for image in result.img_contents:
-            path = await image.path_task.safe_get()
-            if path is None or not path.exists():
-                continue
-            yield [Comp.Image.fromFileSystem(str(path))]
+        if not skip_images:
+            for image in result.img_contents:
+                path = await image.path_task.safe_get()
+                if path is None or not path.exists():
+                    continue
+                yield [Comp.Image.fromFileSystem(str(path))]
 
-        for graphic in result.graphics:
-            if not isinstance(graphic, ImageContent):
-                continue
-            path = await graphic.path_task.safe_get()
-            if path is None or not path.exists():
-                continue
-            yield [Comp.Image.fromFileSystem(str(path))]
+            for graphic in result.graphics:
+                if not isinstance(graphic, ImageContent):
+                    continue
+                path = await graphic.path_task.safe_get()
+                if path is None or not path.exists():
+                    continue
+                yield [Comp.Image.fromFileSystem(str(path))]
 
         # 转发的原帖图片同样归富媒体（微博/NGA 那种 repost 里有图集的情况）。
         # 递归只走一层：repost 不会自己再套 repost。
         if result.repost is not None:
-            async for parts in self._iter_media_components(result.repost):
+            async for parts in self._iter_media_components(
+                result.repost, skip_images=skip_images
+            ):
                 yield parts
 
         for cont in result.contents:

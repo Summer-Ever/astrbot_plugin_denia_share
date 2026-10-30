@@ -685,6 +685,99 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "unit": "个",
         "hint": "仅「按条件聚合」生效：本次待发送的图片与视频节点总数达到该值时合并。语音、文件、精简文字和卡片不计入。0=这一项不触发",
     },
+    # ---------------- Markdown 图片展示 ---------------- #
+    # 与合并转发是**互斥的两条路径**：命中 Markdown 阈值时优先走 Markdown，
+    # 不再打包成 Nodes。合并转发只有 OneBot 支持，而 Markdown 恰好是 QQ 官方
+    # 机器人能渲染图片的通道，所以这条路径不依赖 _is_onebot。
+    {
+        "key": "MARKDOWN_IMAGE_ENABLED",
+        "group": "合并转发",
+        "label": "用 Markdown 集中展示图片",
+        "type": "bool",
+        "default": False,
+        "hint": (
+            "开启后，图片数量达到下面的阈值时不再合并转发，而是把图片按 "
+            "Markdown 语法集中成一条（或几条）消息展示。"
+            "适用于 QQ 官方机器人这类不支持合并转发的协议端；"
+            "图片本身必须带公网 URL（平台直链），本地文件无法用 Markdown 渲染。"
+            "本项优先于「聚合方式」，关闭后行为与原来完全一致"
+        ),
+    },
+    {
+        "key": "MARKDOWN_IMAGE_THRESHOLD",
+        "group": "合并转发",
+        "label": "Markdown 图片阈值",
+        "type": "int",
+        "default": 3,
+        "min": 0,
+        "max": 99,
+        "unit": "张",
+        "hint": "图片数量达到该值就改用 Markdown 集中展示。0=这一项不触发（等于关闭）",
+    },
+    {
+        "key": "MARKDOWN_IMAGE_MAX_PER_MSG",
+        "group": "合并转发",
+        "label": "单条最大图片数",
+        "type": "int",
+        "default": 10,
+        "min": 1,
+        "max": 30,
+        "unit": "张",
+        "hint": "单条 Markdown 消息最多展示多少张图，超出时按顺序自动拆成多条，不重不漏",
+    },
+    {
+        "key": "MARKDOWN_IMAGE_PER_ROW",
+        "group": "合并转发",
+        "label": "每行图片数",
+        "type": "int",
+        "default": 3,
+        "min": 1,
+        "max": 5,
+        "unit": "张",
+        "hint": "Markdown 里每行并排展示的图片数量，1 表示每张图独占一行",
+    },
+    {
+        "key": "MARKDOWN_IMAGE_WIDTH",
+        "group": "合并转发",
+        "label": "Markdown 图片宽度",
+        "type": "int",
+        "default": 200,
+        "min": 50,
+        "max": 600,
+        "unit": "px",
+        "hint": (
+            "QQ 官方机器人要求 Markdown 图片写成 ![文字 #宽px #高px](链接)，"
+            "缺了宽高 QQ 只显示成 [image] 链接文字、图片不出来。默认 200"
+        ),
+    },
+    {
+        "key": "MARKDOWN_IMAGE_HEIGHT",
+        "group": "合并转发",
+        "label": "Markdown 图片高度",
+        "type": "int",
+        "default": 200,
+        "min": 50,
+        "max": 600,
+        "unit": "px",
+        "hint": (
+            "等比模式下这是「最大高度」：按原图比例算出的高度超过它就压宽度封顶，"
+            "比例不变。固定模式则直接作为显示高度"
+        ),
+    },
+    {
+        "key": "MARKDOWN_IMAGE_SIZE_MODE",
+        "group": "合并转发",
+        "label": "图片尺寸模式",
+        "type": "select",
+        "default": "auto",
+        "options": ["auto", "fixed"],
+        "labels": ["等比不扭曲（推荐）", "固定宽高"],
+        "hint": (
+            "auto：按每张原图的真实宽高算等比高度，不拉伸不变形；"
+            "fixed：所有图强制成上面设置的宽×高，竖图会被压扁。"
+            "本地图片读不到尺寸时回退到固定宽高"
+        ),
+    },
     # ---------------- 高级设置 ---------------- #
     {
         "key": "XIAOHEIHE_CK", "group": "高级设置", "subgroup": "平台凭据",
@@ -1629,6 +1722,64 @@ class ParserConfig:
                 (self.AGGREGATION_NODE_THRESHOLD, node_count),
             )
         )
+
+    # ---------------- Markdown 图片展示 ---------------- #
+
+    @property
+    def MARKDOWN_IMAGE_ENABLED(self) -> bool:
+        return bool(self._cfg_get("MARKDOWN_IMAGE_ENABLED", False))
+
+    @property
+    def MARKDOWN_IMAGE_THRESHOLD(self) -> int:
+        return _aggregation_threshold(self._cfg_get("MARKDOWN_IMAGE_THRESHOLD", 3), 3)
+
+    @property
+    def MARKDOWN_IMAGE_MAX_PER_MSG(self) -> int:
+        """单条 Markdown 最多图片数，至少 1（0 会让拆分死循环）。"""
+        return max(
+            1,
+            _aggregation_threshold(self._cfg_get("MARKDOWN_IMAGE_MAX_PER_MSG", 10), 10),
+        )
+
+    @property
+    def MARKDOWN_IMAGE_PER_ROW(self) -> int:
+        """每行图片数，夹在 1..5。"""
+        value = _aggregation_threshold(self._cfg_get("MARKDOWN_IMAGE_PER_ROW", 3), 3)
+        return min(5, max(1, value))
+
+    @property
+    def MARKDOWN_IMAGE_WIDTH(self) -> int:
+        """Markdown 内嵌图宽度（px）。QQ 要求显式宽高，缺了不渲染。"""
+        value = _aggregation_threshold(self._cfg_get("MARKDOWN_IMAGE_WIDTH", 200), 200)
+        return min(600, max(50, value))
+
+    @property
+    def MARKDOWN_IMAGE_HEIGHT(self) -> int:
+        """Markdown 内嵌图高度（px）。等比模式下作为最大高度上限。"""
+        value = _aggregation_threshold(self._cfg_get("MARKDOWN_IMAGE_HEIGHT", 200), 200)
+        return min(600, max(50, value))
+
+    @property
+    def MARKDOWN_IMAGE_SIZE_MODE(self) -> str:
+        """尺寸模式：``auto`` 等比不扭曲 / ``fixed`` 固定宽高。
+
+        读侧白名单回退：脏值一律当 ``auto``，因为等比是更安全的默认
+        （固定宽高会把竖图压扁，属于用户能立刻看出来的观感问题）。
+        """
+        value = str(self._cfg_get("MARKDOWN_IMAGE_SIZE_MODE", "auto") or "").strip().lower()
+        return value if value in ("auto", "fixed") else "auto"
+
+    def should_send_markdown_images(self, image_count: int) -> bool:
+        """这次是否改用 Markdown 集中展示图片。
+
+        与 :meth:`should_aggregate_nodes` 独立判定：Markdown 是本插件自己的
+        通道（QQ 官方机器人可渲染），不依赖 OneBot；命中时由调用方优先走它。
+        阈值为 0 视为关闭，避免「0 张图也触发」这种反直觉结果。
+        """
+        if not self.MARKDOWN_IMAGE_ENABLED:
+            return False
+        threshold = self.MARKDOWN_IMAGE_THRESHOLD
+        return threshold > 0 and int(image_count or 0) >= threshold
 
     # ---------------- 渲染 ---------------- #
 

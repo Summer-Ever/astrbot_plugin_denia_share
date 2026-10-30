@@ -586,7 +586,8 @@ class BaseParser:
                         lambda u=url: self.downloader.download_img(
                             u, ext_headers=self.headers
                         )
-                    )
+                    ),
+                    url=url,
                 )
             )
         return contents
@@ -605,6 +606,7 @@ class BaseParser:
 
     def create_image(self, url_or_task: str | asyncio.Task[Path], alt: str | None = None):
         if isinstance(url_or_task, str):
+            url = url_or_task
             path_task = PathTask.lazy(
                 lambda url=url_or_task: self.downloader.download_img(
                     url, ext_headers=self.headers
@@ -612,10 +614,12 @@ class BaseParser:
             )
         else:
             # 外部已调度好的 Task：保持急式语义（不归我们管，也没法再变惰性）
+            # 这条路径拿不到原始 URL，Markdown 展示时会被跳过。
+            url = None
             path_task = (
                 url_or_task if isinstance(url_or_task, PathTask) else PathTask(url_or_task)
             )
-        return ImageContent(path_task, alt=alt)
+        return ImageContent(path_task, alt=alt, url=url)
 
     def create_audio(self, url_or_task: str | asyncio.Task[Path], duration: float = 0.0):
         """把音频 URL / 任务包成 :class:`AudioContent`（**URL 形态是惰性的**）。

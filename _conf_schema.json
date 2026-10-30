@@ -599,6 +599,78 @@
         "min": 0,
         "max": 999,
         "unit": "个"
+      },
+      "MARKDOWN_IMAGE_ENABLED": {
+        "description": "用 Markdown 集中展示图片",
+        "type": "bool",
+        "default": false,
+        "invisible": true,
+        "hint": "开启后，图片数量达到下面的阈值时不再合并转发，而是把图片按 Markdown 语法集中成一条（或几条）消息展示。适用于 QQ 官方机器人这类不支持合并转发的协议端；图片本身必须带公网 URL（平台直链），本地文件无法用 Markdown 渲染。本项优先于「聚合方式」，关闭后行为与原来完全一致"
+      },
+      "MARKDOWN_IMAGE_THRESHOLD": {
+        "description": "Markdown 图片阈值",
+        "type": "int",
+        "default": 3,
+        "invisible": true,
+        "hint": "图片数量达到该值就改用 Markdown 集中展示。0=这一项不触发（等于关闭）",
+        "min": 0,
+        "max": 99,
+        "unit": "张"
+      },
+      "MARKDOWN_IMAGE_MAX_PER_MSG": {
+        "description": "单条最大图片数",
+        "type": "int",
+        "default": 10,
+        "invisible": true,
+        "hint": "单条 Markdown 消息最多展示多少张图，超出时按顺序自动拆成多条，不重不漏",
+        "min": 1,
+        "max": 30,
+        "unit": "张"
+      },
+      "MARKDOWN_IMAGE_PER_ROW": {
+        "description": "每行图片数",
+        "type": "int",
+        "default": 3,
+        "invisible": true,
+        "hint": "Markdown 里每行并排展示的图片数量，1 表示每张图独占一行",
+        "min": 1,
+        "max": 5,
+        "unit": "张"
+      },
+      "MARKDOWN_IMAGE_WIDTH": {
+        "description": "Markdown 图片宽度",
+        "type": "int",
+        "default": 200,
+        "invisible": true,
+        "hint": "QQ 官方机器人要求 Markdown 图片写成 ![文字 #宽px #高px](链接)，缺了宽高 QQ 只显示成 [image] 链接文字、图片不出来。默认 200",
+        "min": 50,
+        "max": 600,
+        "unit": "px"
+      },
+      "MARKDOWN_IMAGE_HEIGHT": {
+        "description": "Markdown 图片高度",
+        "type": "int",
+        "default": 200,
+        "invisible": true,
+        "hint": "等比模式下这是「最大高度」：按原图比例算出的高度超过它就压宽度封顶，比例不变。固定模式则直接作为显示高度",
+        "min": 50,
+        "max": 600,
+        "unit": "px"
+      },
+      "MARKDOWN_IMAGE_SIZE_MODE": {
+        "description": "图片尺寸模式",
+        "type": "string",
+        "default": "auto",
+        "invisible": true,
+        "hint": "auto：按每张原图的真实宽高算等比高度，不拉伸不变形；fixed：所有图强制成上面设置的宽×高，竖图会被压扁。本地图片读不到尺寸时回退到固定宽高",
+        "options": [
+          "auto",
+          "fixed"
+        ],
+        "labels": [
+          "等比不扭曲（推荐）",
+          "固定宽高"
+        ]
       }
     }
   },

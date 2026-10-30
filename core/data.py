@@ -60,6 +60,18 @@ class VideoContent(MediaContent):
 class ImageContent(MediaContent):
     """图片内容"""
     alt: str | None = None
+    #: 原始图片公网 URL。惰性下载任务只记路径、不保留来源地址，
+    #: 所以需要「用 Markdown 集中展示图片」时得单独存一份。
+    #: 由外部传入现成 Task 的构造方式拿不到 URL，此时保持 ``None``。
+    url: str | None = None
+
+    def __repr__(self) -> str:
+        parts = [str(self.path_task)]
+        if self.alt:
+            parts.append(f"alt={self.alt}")
+        if self.url:
+            parts.append(f"url={self.url}")
+        return f"ImageContent({', '.join(parts)})"
 
 
 @dataclass(slots=True)
