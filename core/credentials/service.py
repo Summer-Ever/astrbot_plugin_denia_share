@@ -26,6 +26,7 @@ from .importers import (
     CredentialImportError,
     parse_credential,
 )
+from ..music.client import text_of
 
 # ---- 状态取值（契约固定） ---------------------------------------------- #
 STATUS_UNCONFIGURED = "unconfigured"
@@ -168,6 +169,8 @@ class CredentialManager:
         self._status: dict[str, dict[str, Any]] = {}
         self._sources: dict[str, str] = {}
         self._source_listener = None
+        # 标记「本次探针自己轮换了 Cookie」（QQ 续期式校验），check 复查指纹时放行。
+        self._probe_rotated: dict[str, bool] = {}
 
     # ------------------------------------------------------------------ #
     # 内部小工具
@@ -362,11 +365,15 @@ class CredentialManager:
             except Exception:
                 status, message = STATUS_ERROR, "检查请求出错，请稍后重试"
 
-            # 返回前复查指纹：期间被扫码/导入/清除换掉，就不覆盖新状态。
-            if _fingerprint(self._current_secret(spec.id)) != before:
+            # 返回前复查指纹：QQ 探针内的服务端续期可能合法地轮换了 Cookie——
+            # 那是本次检查自己的产物，按新指纹记录；除此之外的指纹变化意味着
+            # 期间被扫码/导入/清除换掉，就不覆盖新状态。
+            after = _fingerprint(self._current_secret(spec.id))
+            if after != before and not self._probe_rotated.pop(spec.id, False):
                 self._status.pop(spec.id, None)
             else:
-                self._record(spec.id, before, status, message)
+                self._probe_rotated.pop(spec.id, None)
+                self._record(spec.id, after or before, status, message)
             return self.snapshot()
 
     def _client_kwargs(self, spec: PlatformSpec) -> dict[str, Any]:
@@ -385,9 +392,47 @@ class CredentialManager:
             kwargs["proxy"] = proxy
         return kwargs
 
+    async def _probe_qqmusic_via_refresh(self) -> tuple[str, str] | None:
+        """用续期端点做 QQ 音乐的权威判活；结论不明确时返回 None 走探针兜底。
+
+        成功即服务端已确认凭据并轮换了 Cookie（等价一次续期），调用方要靠
+        ``_probe_rotated`` 放行 check 的指纹复查。错误信息只看状态机给出的
+        安全文案，不解析任何敏感内容。
+        """
+        try:
+            controller = getattr(self._plugin, "_get_music_controller", None)
+            manager = controller().login if callable(controller) else None
+            if manager is None:
+                return None
+            result = await manager.refresh("qqmusic")
+        except Exception:
+            return None
+        message = str(result.get("message", ""))
+        if result.get("state") == "success":
+            self._probe_rotated["qqmusic"] = True
+            return STATUS_VALID, "QQ 音乐登录态有效（服务端已确认并续期）"
+        if "没有可续期" in message or "没有 QQ 音乐登录态" in message:
+            return None  # 纯 Cookie 导入，没有移动端凭据，交给探针兜底
+        if "授权已失效" in message:
+            return STATUS_INVALID, "QQ 音乐服务端确认登录态已失效，请重新扫码登录"
+        return None  # 频控/设备上限/网络波动/已取消：结论不明确，探针再试一次
+
     async def _probe(self, spec: PlatformSpec, secret: str) -> tuple[str, str]:
         if spec.id == "xiaoheihe":
             return STATUS_UNKNOWN, "已保存；请用帖子链接确认可用性，平台要求验证时请先在小黑盒网页完成"
+        if spec.id == "qqmusic":
+            # 判活选型（2026-11-01 真机实测）：
+            # * GetLoginUserInfo 对鉴权完全不敏感（空/垃圾 authst 也回 code 0 与
+            #   全量资料），没有判别力，绝不能用；
+            # * 个人主页端点判别力成立（有效→0 / 无效→1000）但有 IP 限流，被限流
+            #   时一律 404；
+            # * 续期端点 music.login.LoginServer 是唯一权威信号：服务端接受凭据
+            #   并换发新 key（0），明确宣告失效（1000/104400/104401）。扫码用户
+            #   优先走它——顺带完成续期；没有移动端凭据（纯 Cookie 导入）才回退
+            #   到主页探针。
+            rotated = await self._probe_qqmusic_via_refresh()
+            if rotated is not None:
+                return rotated
         if spec.id in {"netease", "qqmusic"}:
             from ..music.netease import NeteaseProvider
             from ..music.qqmusic import QQMusicProvider
@@ -399,8 +444,11 @@ class CredentialManager:
                 status = result.get("status")
                 if status not in {STATUS_VALID, STATUS_INVALID, STATUS_UNKNOWN}:
                     status = STATUS_UNKNOWN
-                return status, {STATUS_VALID: "登录态有效", STATUS_INVALID: "登录态已失效",
-                                STATUS_UNKNOWN: "暂时无法确认，请稍后重试"}[status]
+                # provider 的文案已按安全规范生成（含昵称等自查信息），原样沿用。
+                message = text_of(result.get("message")) or {
+                    STATUS_VALID: "登录态有效", STATUS_INVALID: "登录态已失效",
+                    STATUS_UNKNOWN: "暂时无法确认，请稍后重试"}[status]
+                return status, message
             except Exception:
                 return STATUS_UNKNOWN, "暂时无法确认（网络或代理不可用）"
         target = CHECK_TARGETS[spec.id]

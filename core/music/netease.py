@@ -31,8 +31,23 @@ BASE_URL: Final[str] = "https://music.163.com/"
 SONG_URL: Final[str] = "https://music.163.com/song?id={}"
 
 HEADERS: Final[dict[str, str]] = {"Referer": BASE_URL}
-# 从高到低逐级降档：登录态越好拿到的码率越高，拿不到就退一档。
+# 点歌音质（MUSIC_QUALITY）：设定的是「尝试的最高档」，拿不到自动降一档。
+# high 与升级前行为一致（默认）；无损需要账号权益，匿名只拿得到 standard。
 QUALITY_TIERS: Final[tuple[str, ...]] = ("lossless", "exhigh", "standard")
+_QUALITY_TOP: Final[dict[str, str]] = {
+    "standard": "standard",
+    "high": "exhigh",
+    "lossless": "lossless",
+}
+
+
+def _quality_tiers() -> tuple[str, ...]:
+    """按配置的音质档返回尝试顺序：所选档优先，逐级降档兜底。"""
+    from ..config import get_config
+
+    value = str(get_config().current_values().get('MUSIC_QUALITY', 'high') or 'high')
+    top = _QUALITY_TOP.get(value.strip().lower(), "exhigh")
+    return QUALITY_TIERS[QUALITY_TIERS.index(top):]
 
 DEFAULT_TITLE: Final[str] = "未知歌曲"
 DEFAULT_ARTIST: Final[str] = "未知歌手"
@@ -151,7 +166,7 @@ class NeteaseProvider(BaseProvider):
         if not cookie:
             return None
         headers = {"Referer": BASE_URL, "Cookie": cookie}
-        for level in QUALITY_TIERS:
+        for level in _quality_tiers():
             form = weapi_form(
                 {
                     "ids": f"[{song.id}]",

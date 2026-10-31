@@ -42,6 +42,7 @@ from .constants import (
 )
 from .exception import IgnoreException, ParseException
 from .media_utils import clear_cache_dir, cleanup_cache_dir, is_docker_environment
+from .music.models import MusicError
 from .relay import resolve_callback_base
 from .screenshot import is_probably_screenshotable
 # 注意：``json_response`` / ``error_response`` **故意不在这里别名导入** ——
@@ -552,6 +553,9 @@ class WebUIApi:
             allowed = {"task_id", "state", "message", "qr_data_url", "nickname"}
             public = {key: val for key, val in result.items() if key in allowed}
             return _json_response(public)
+        except MusicError as exc:
+            logger.warning("[denia_share] 音乐登录操作未完成: action=%s error=%s", action, type(exc).__name__)
+            return _error(str(exc))
         except Exception as exc:
             logger.warning("[denia_share] 音乐登录操作失败: action=%s error=%s", action, type(exc).__name__)
             return _error("音乐登录操作未完成，请重试或使用 Cookie 导入", 400)

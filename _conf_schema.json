@@ -166,16 +166,33 @@
         "type": "string",
         "default": "both",
         "invisible": true,
-        "hint": "也可以在指令里指定，例如：搜歌 QQ 晴天。",
+        "hint": "也可以在指令里指定，例如：搜歌 QQ 晴天。全部时两家交错排列，编号连续。",
         "options": [
           "both",
           "netease",
           "qqmusic"
         ],
         "labels": [
-          "两家一起搜",
+          "全部",
           "网易云音乐",
           "QQ音乐"
+        ]
+      },
+      "MUSIC_QUALITY": {
+        "description": "点歌音质",
+        "type": "string",
+        "default": "high",
+        "invisible": true,
+        "hint": "点歌取流尝试的最高音质，拿不到时自动降档。无损需要账号权益（网易云 VIP / QQ音乐绿钻），匿名或免费账号会自动退到较低档。",
+        "options": [
+          "standard",
+          "high",
+          "lossless"
+        ],
+        "labels": [
+          "标准（128k）",
+          "较高（320k，默认）",
+          "无损（FLAC，需会员权益）"
         ]
       },
       "MUSIC_SEARCH_LIMIT": {
@@ -183,7 +200,7 @@
         "type": "int",
         "default": 5,
         "invisible": true,
-        "hint": "结果卡片最多显示这些候选；两家一起搜时交错排列，编号连续。",
+        "hint": "结果卡片最多显示这些候选；全部时两家交错排列，编号连续。",
         "min": 1,
         "max": 10
       },
@@ -216,7 +233,7 @@
         "type": "text",
         "default": "",
         "invisible": true,
-        "hint": "在上方账号凭据导入 MUSIC_U 或完整 Cookie，会员歌曲按账号实际权限获取。扫码不可用时可直接导入。",
+        "hint": "在上方账号凭据导入 MUSIC_U 或完整 Cookie（获取步骤见凭据页提示），会员歌曲按账号实际权限获取。第三方扫码已被网易封禁，Cookie 导入是唯一方式。",
         "secret": true
       },
       "QQMUSIC_CK": {
@@ -355,16 +372,14 @@
         "type": "string",
         "default": "voice",
         "invisible": true,
-        "hint": "仅在富媒体开启时生效。音频文件保留原格式；失败兜底仅针对发送接口报错或明确返回失败，无法检测接口成功但客户端未收到的情况。超时也会尝试文件，可能同时收到语音和文件。",
+        "hint": "语音条发送失败时自动改发音频文件；音频文件则直接发文件。超时可能导致语音和文件同时送达；接口返回成功但客户端未收到时无法检测。分容器发送文件可使用中转、共享目录或宿主路径映射。",
         "options": [
           "voice",
-          "file",
-          "voice_fallback_file"
+          "file"
         ],
         "labels": [
           "语音条",
-          "音频文件",
-          "语音条（失败后发送文件）"
+          "音频文件"
         ]
       },
       "SEND_BACKGROUND_MUSIC": {

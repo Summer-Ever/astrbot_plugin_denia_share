@@ -69,22 +69,74 @@ function fmtCheckedAt(value) {
   );
 }
 
-/** 平台专属的一句提示，替代暴露实现细节的技术文案。 */
+/** 平台专属的获取指引，替代暴露实现细节的技术文案。换行用 \n，样式按 pre-line 渲染。 */
 function platformTip(platform) {
-  if (platform.id === "netease") return "可导入完整 Cookie，或 MUSIC_U=登录值。会员歌曲按账号权限获取；扫码受限时使用 Cookie 导入。";
-  if (platform.id === "qqmusic") return "可用手机 QQ 扫码，或导入含 uin 和音乐密钥的 Cookie。扫码登录保存的凭据支持续期。";
-  const isToken = platform.kind === "token" || platform.id === "github";
-  const what = isToken ? "Token" : "Cookie";
-  if (platform.id === "bilibili") {
+  if (platform.id === "netease") {
     return (
-      `支持直接粘贴浏览器里复制的 ${what}，也可以在本页或「总览」页扫码登录。` +
-      "当前实际使用哪一份，请看上方的生效来源。"
+      "获取步骤：\n" +
+      "1. 电脑浏览器打开 music.163.com 并登录（扫码或账号均可）；\n" +
+      "2. 按 F12 打开开发者工具，切到「网络 / Network」标签，按 F5 刷新页面；\n" +
+      "3. 点列表里第一条 music.163.com 请求，在「请求标头 / Request Headers」里找到 Cookie，整串复制粘贴到上面；\n" +
+      "4. 或在「应用 / Application → Cookie → music.163.com」里只复制 MUSIC_U 的值，粘贴为 MUSIC_U=值。\n" +
+      "会员歌曲按账号实际权益获取；扫码登录已下线（网易已封禁第三方扫码），Cookie 导入是唯一方式。"
     );
   }
-  if (isToken) {
-    return `请粘贴 GitHub 创建的个人访问令牌（${what}），不要使用网站 Cookie。`;
+  if (platform.id === "qqmusic") {
+    return (
+      "推荐：点上方「扫码登录」用手机 QQ 扫码，保存的凭据支持自动续期。\n" +
+      "手动导入步骤：\n" +
+      "1. 电脑浏览器打开 y.qq.com 并登录（手机 QQ 扫码即可）；\n" +
+      "2. 按 F12 →「网络 / Network」→ 刷新页面 → 点任一条 y.qq.com 请求；\n" +
+      "3. 在「请求标头」的 Cookie 里找到 uin 和 qm_keyst（或 qqmusic_key）两段；\n" +
+      "4. 粘贴为 uin=值; qm_keyst=值（分号分隔），或整串 Cookie 直接粘贴。\n" +
+      "只导入 Cookie 无法自动续期，过期后需重新导入。"
+    );
   }
-  return `支持浏览器里复制的原始 ${what}、请求头、cURL 命令、JSON 或 cookies.txt 文件。`;
+  if (platform.id === "bilibili") {
+    return (
+      "获取步骤：\n" +
+      "1. 电脑浏览器登录 bilibili.com；\n" +
+      "2. F12 →「网络 / Network」→ 刷新页面 → 点第一条 bilibili.com 请求；\n" +
+      "3. 在「请求标头 / Request Headers」里把 Cookie 整串复制粘贴到上面（必须包含 SESSDATA）。\n" +
+      "也可以在本页或「总览」页直接扫码登录；当前实际生效的是哪一份，请看上方的生效来源。"
+    );
+  }
+  if (platform.id === "xiaohongshu") {
+    return (
+      "获取步骤：\n" +
+      "1. 电脑浏览器登录 xiaohongshu.com；\n" +
+      "2. F12 →「网络 / Network」→ 刷新页面 → 点任一条 xiaohongshu.com 请求；\n" +
+      "3. 在「请求标头」的 Cookie 整串复制粘贴（需包含 web_session）。"
+    );
+  }
+  if (platform.id === "pixiv") {
+    return (
+      "获取步骤：\n" +
+      "1. 电脑浏览器登录 pixiv.net（能正常看到登录态即可）；\n" +
+      "2. F12 →「网络 / Network」→ 刷新页面 → 点任一条 pixiv.net 请求；\n" +
+      "3. 在「请求标头」的 Cookie 整串复制粘贴（需包含 PHPSESSID）。"
+    );
+  }
+  if (platform.id === "xiaoheihe") {
+    return (
+      "获取步骤：\n" +
+      "1. 电脑浏览器登录 xiaoheihe.cn（小黑盒网页版）；\n" +
+      "2. F12 →「网络 / Network」→ 刷新页面 → 点任一条请求；\n" +
+      "3. 在「请求标头」的 Cookie 整串复制粘贴到上面。\n" +
+      "平台风控较严：部分内容要求先在小黑盒网页里完成一次验证。"
+    );
+  }
+  if (platform.id === "github") {
+    return (
+      "这里要的是 Token，不是 Cookie。获取步骤：\n" +
+      "1. 登录 GitHub → 右上头像 → Settings → 左栏最底部 Developer settings；\n" +
+      "2. Personal access tokens → Tokens (classic) → Generate new token (classic)；\n" +
+      "3. 备注随便填，权限一项都不勾也可以（读公开仓库够用）；\n" +
+      "4. 生成后立即复制粘贴到上面——Token 只显示这一次。"
+    );
+  }
+  const isToken = platform.kind === "token";
+  return `支持浏览器里复制的原始 ${isToken ? "Token" : "Cookie"}、请求头、cURL 命令、JSON 或 cookies.txt 文件。`;
 }
 
 /**

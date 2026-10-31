@@ -15,7 +15,8 @@ import { h, toast } from "./ui.js";
  */
 
 const BILI_PLATFORM = "bilibili";
-const MUSIC_PLATFORMS = ["netease", "qqmusic"];
+// 网易云已下线扫码登录（第三方扫码被网易风控/封禁），统一 Cookie 导入。
+const MUSIC_PLATFORMS = ["qqmusic"];
 const LOGIN_PLATFORMS = [...MUSIC_PLATFORMS, BILI_PLATFORM];
 const ACTIVE_STATES = ["waiting", "scanned"];
 const QR_IMAGE_RE = /^data:image\/(?:png|jpeg|webp);base64,/;

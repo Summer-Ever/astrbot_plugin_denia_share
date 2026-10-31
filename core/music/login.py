@@ -2,8 +2,8 @@
 
 两条平台路线差别很大，这里刻意不抽象成同一个基类：
 
-* 网易云：``weapi/login/qrcode/*`` 三个状态码，登录成功直接给 ``MUSIC_U``，
-  它本身就是长期凭据，不需要续期；
+* 网易云：``weapi/login/qrcode/*`` 三个状态码，登录成功
+  直接给 ``MUSIC_U``，它本身就是长期凭据，不需要续期；
 * QQ 音乐：``ptqrlogin`` 只给一个跳转 URL，必须再走 ``check_sig`` →
   ``oauth2.0/authorize`` → ``QQConnectLogin.LoginServer`` 才能换到
   ``musickey`` + ``refresh_token``，之后靠 refresh 续命。
@@ -37,6 +37,10 @@ from .crypto import hash33, music_u_of, weapi_form
 from .models import MusicError
 
 PLATFORMS: Final[frozenset[str]] = frozenset({"netease", "qqmusic"})
+# 扫码只开放 QQ 音乐。网易云已封禁第三方扫码（上游 MusicUID 同结论）：weapi
+# 会被 IP 风控成 8821/-462，interface type=3 产出云端不认的二等会话（媒体 403、
+# 安全中心无设备）。网易云统一走 Cookie 导入，见凭据页的获取指引。
+QR_PLATFORMS: Final[frozenset[str]] = frozenset({"qqmusic"})
 
 # -- 会话生命周期 -----------------------------------------------------------
 TASK_TTL_SEC: Final[float] = 600.0
@@ -45,6 +49,11 @@ TASK_ID_LEN: Final[int] = 32
 
 # -- 网易云 -----------------------------------------------------------------
 _NETEASE_BASE: Final[str] = "https://music.163.com/"
+# 扫码固定走 weapi + type=1（web 会话）：这套会话与浏览器登录同源，云端完全
+# 认可（安全中心可见、媒体可下）。interface.music.163.com 的 /api + type=3
+# 虽然：风控更宽松，但产出的是云账号体系不认的「二等会话」——媒体 CDN 一律
+# 403、安全中心无设备（2026-11-01 真机实测），不能用作登录态。
+# 上游 MusicUID 同样用 weapi；被风控（-462/8821）时以 Cookie 导入兜底。
 _NETEASE_UNIKEY: Final[str] = "weapi/login/qrcode/unikey"
 _NETEASE_CHECK: Final[str] = "weapi/login/qrcode/client/login"
 _NETEASE_QR_PREFIX: Final[str] = "https://music.163.com/login?codekey="
@@ -59,6 +68,11 @@ _QQ_HEADERS: Final[dict[str, str]] = {
     "User-Agent": USER_AGENT,
     "Referer": "https://y.qq.com/",
 }
+_QQ_LOGIN_REFERER: Final[str] = "https://xui.ptlogin2.qq.com/"
+# 与参考实现保持相同的 QQ 互联授权回调地址。
+_QQ_REDIRECT_URI: Final[str] = (
+    "https://y.qq.com/portal/wx_redirect.html?login_type=1&surl=https://y.qq.com/"
+)
 _QQ_QR_PARAMS: Final[dict[str, str]] = {
     "appid": "716027609",
     "e": "2",
@@ -98,6 +112,57 @@ def _int_of(value: Any, fallback: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _safe_business_code(value: Any) -> int | None:
+    """Return a bounded integer code suitable for logs and user diagnostics."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        code = value
+    elif isinstance(value, str) and re.fullmatch(r"-?\d{1,10}", value.strip()):
+        code = int(value.strip())
+    else:
+        return None
+    return code if -(2**31) <= code <= 2**31 - 1 else None
+
+
+class _LoginStageError(MusicError):
+    """A safe login failure annotated with a non-secret diagnostic stage."""
+
+    def __init__(self, stage: str, message: str, *, code: int | None = None) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.code = code
+
+
+class _QQStageError(_LoginStageError):
+    """QQ 登录链路中的阶段错误。
+
+    ``stage`` / ``code`` 只用于后台日志定位，用户文案仍只走 ``MusicError``
+    的安全消息，不携带 URL、Cookie、token 或服务端原始 ``errMsg``。
+    """
+
+def _log_login_failure(platform: str, exc: BaseException) -> None:
+    """只记录平台、阶段、异常类型和上游整数码。
+
+    响应体、请求 URL、Cookie、token 与原始错误消息一律不落日志。
+    """
+    stage = text_of(getattr(exc, "stage", "")) or "unexpected"
+    code = getattr(exc, "code", None)
+    safe_code = _safe_business_code(code)
+    try:
+        from astrbot.api import logger
+
+        logger.warning(
+            "[denia_share] 音乐登录操作失败: platform=%s stage=%s error=%s code=%s",
+            platform,
+            stage,
+            type(exc).__name__,
+            safe_code if safe_code is not None else "-",
+        )
+    except Exception:  # noqa: BLE001 - 日志不可用不能影响登录状态机
+        return
 
 
 def _music_id_of(value: Any) -> str:
@@ -174,6 +239,7 @@ def _parse_credential(
     nick: str = "",
     fallback_uin: str = "",
     fallback_expires: int = DEFAULT_KEY_EXPIRES,
+    fallback_login_type: int = 2,
 ) -> QQMobileCredential:
     """从 ``QQLogin`` / refresh 的响应体里取出凭据。"""
     node = data if isinstance(data, dict) else {}
@@ -183,6 +249,12 @@ def _parse_credential(
         raise MusicError("返回的 musickey 或 refresh_token 为空")
     musicid = _music_id_of(node.get("musicid")) or _music_id_of(node.get("str_musicid")) or _music_id_of(fallback_uin)
     expires = _int_of(node.get("keyExpiresIn"), fallback_expires) or fallback_expires
+    raw_login_type = node.get("login_type")
+    if raw_login_type is None:
+        raw_login_type = node.get("loginType")
+    if raw_login_type is None:
+        raw_login_type = node.get("tmeLoginType")
+    login_type = fallback_login_type if raw_login_type in (None, "") else _int_of(raw_login_type, 0)
     return QQMobileCredential(
         openid=text_of(node.get("openid")),
         refresh_token=refresh_token,
@@ -195,8 +267,70 @@ def _parse_credential(
         refresh_key=text_of(node.get("refresh_key")),
         musickey_create_time=_int_of(node.get("musickeyCreateTime"), int(time.time())),
         key_expires_in=expires,
-        login_type=_int_of(node.get("login_type"), 2),
+        login_type=login_type,
         nick=nick or text_of(node.get("nick")),
+    )
+
+
+def _merge_refreshed_credential(
+    data: Any, previous: QQMobileCredential
+) -> QQMobileCredential:
+    """Merge a partial key rotation without dropping the current account tokens."""
+    if not isinstance(data, dict):
+        raise _QQStageError("refresh_response", "QQ 音乐续期返回数据格式不符合预期")
+    musickey = text_of(data.get("musickey"))
+    if not musickey:
+        raise _QQStageError(
+            "refresh_response", "QQ 音乐续期未返回新 musickey，请稍后重试", code=0
+        )
+
+    incoming_login_type = data.get("login_type")
+    if incoming_login_type is None:
+        incoming_login_type = data.get("loginType")
+    if incoming_login_type is None:
+        incoming_login_type = data.get("tmeLoginType")
+    if incoming_login_type not in (None, ""):
+        parsed_login_type = _int_of(incoming_login_type, 0)
+        if parsed_login_type not in (1, 2) or parsed_login_type != previous.login_type:
+            raise _QQStageError("refresh_account", "QQ 音乐续期账号信息不一致")
+
+    identity_fields = (
+        ("musicid", _music_id_of(data.get("musicid")), _music_id_of(previous.musicid)),
+        ("str_musicid", _music_id_of(data.get("str_musicid")), _music_id_of(previous.str_musicid)),
+        ("openid", text_of(data.get("openid")), text_of(previous.openid)),
+        ("unionid", text_of(data.get("unionid")), text_of(previous.unionid)),
+    )
+    for _, incoming, existing in identity_fields:
+        if incoming and existing and incoming != existing:
+            raise _QQStageError("refresh_account", "QQ 音乐续期返回了其他账号的凭据")
+    existing_uids = {
+        value for value in (_music_id_of(previous.musicid), _music_id_of(previous.str_musicid)) if value
+    }
+    incoming_uids = {
+        value for value in (_music_id_of(data.get("musicid")), _music_id_of(data.get("str_musicid"))) if value
+    }
+    if existing_uids and any(value not in existing_uids for value in incoming_uids):
+        raise _QQStageError("refresh_account", "QQ 音乐续期返回了其他账号的凭据")
+
+    create_time = _int_of(data.get("musickeyCreateTime"), 0)
+    if create_time <= 0:
+        # A newly rotated key without a timestamp starts its validity window now.
+        create_time = int(time.time())
+    expires = _int_of(data.get("keyExpiresIn"), 0) or previous.key_expires_in or DEFAULT_KEY_EXPIRES
+    return QQMobileCredential(
+        openid=text_of(data.get("openid"), previous.openid),
+        refresh_token=text_of(data.get("refresh_token"), previous.refresh_token),
+        access_token=text_of(data.get("access_token"), previous.access_token),
+        expired_at=_int_of(data.get("expired_at"), previous.expired_at),
+        musicid=_music_id_of(data.get("musicid")) or previous.musicid,
+        musickey=musickey,
+        unionid=text_of(data.get("unionid"), previous.unionid),
+        str_musicid=_music_id_of(data.get("str_musicid")) or previous.str_musicid,
+        refresh_key=text_of(data.get("refresh_key"), previous.refresh_key),
+        musickey_create_time=create_time,
+        key_expires_in=expires,
+        login_type=previous.login_type,
+        nick=text_of(data.get("nick"), previous.nick),
     )
 
 
@@ -433,15 +567,26 @@ class LoginManager:
     async def start(self, platform: str) -> dict[str, str]:
         self._ensure_open()
         key = self._normalize_platform(platform)
+        if key not in QR_PLATFORMS:
+            raise MusicError("网易云音乐已不支持扫码登录，请改用 Cookie 导入")
         generation = await self._advance_generation(key, "登录会话已被新的请求替代")
         cookie = await self._current_cookie(key)
         fingerprint = _fingerprint(cookie)
         if not await self._generation_is_current(key, generation):
             raise MusicError("登录操作已被更新的请求取消")
-        if key == "netease":
-            task = await self._start_netease(fingerprint, generation)
-        else:
-            task = await self._start_qq(fingerprint, generation)
+        try:
+            if key == "netease":
+                task = await self._start_netease(fingerprint, generation)
+            else:
+                task = await self._start_qq(fingerprint, generation)
+        except MusicError as exc:
+            diagnostic = exc if isinstance(exc, _LoginStageError) else _LoginStageError("start", str(exc))
+            _log_login_failure(key, diagnostic)
+            raise
+        except Exception as exc:  # noqa: BLE001 - unknown failures stay redacted
+            safe_error = fetch_error(exc)
+            _log_login_failure(key, _LoginStageError("start", str(safe_error)))
+            raise safe_error from None
         return self._public(task)
 
     async def poll(self, task_id: str) -> dict[str, str]:
@@ -481,6 +626,8 @@ class LoginManager:
                 else:
                     task.state = _FAILED
                     task.message = self._with_hint(str(exc))
+                    diagnostic = exc if isinstance(exc, _LoginStageError) else _LoginStageError("poll", str(exc))
+                    _log_login_failure(task.platform, diagnostic)
                 task.secret.clear()
             except Exception as exc:  # noqa: BLE001
                 if self._closed or task.generation != self._generations[task.platform]:
@@ -489,6 +636,7 @@ class LoginManager:
                 else:
                     task.state = _FAILED
                     task.message = self._with_hint(str(fetch_error(exc)))
+                    _log_login_failure(task.platform, exc)
                 task.secret.clear()
             if self._closed or task.generation != self._generations[task.platform]:
                 task.state = _EXPIRED
@@ -563,29 +711,39 @@ class LoginManager:
 
     # -- 网易云 -------------------------------------------------------------
     async def _start_netease(self, fingerprint: str, generation: int) -> _LoginTask:
-        form = self._netease_form({"type": 1})
         async with self._client("netease") as client:
             try:
                 response = await client.post(
                     _NETEASE_BASE + _NETEASE_UNIKEY,
                     headers=self._netease_headers(),
-                    data=form,
+                    data=weapi_form({"type": 1}),
                 )
             except Exception as exc:  # noqa: BLE001
                 raise fetch_error(exc) from None
         if response.status_code >= 400:
-            raise MusicError("网易云二维码服务暂时不可用，请稍后重试或改用 Cookie 导入")
+            raise _LoginStageError(
+                "unikey_http", "网易云二维码服务暂时不可用，请稍后重试或改用 Cookie 导入",
+                code=response.status_code,
+            )
         try:
             body = response.json()
         except ValueError:
-            raise MusicError("网易云二维码响应无法解析，请改用 Cookie 导入") from None
-        unikey = text_of((body if isinstance(body, dict) else {}).get("unikey"))
+            raise _LoginStageError("unikey_response", "网易云二维码响应无法解析，请改用 Cookie 导入") from None
+        node = body if isinstance(body, dict) else {}
+        unikey = text_of(node.get("unikey"))
         if not unikey:
-            raise MusicError("获取网易云二维码密钥失败，请改用 Cookie 导入")
+            code = _safe_business_code(node.get("code"))
+            if code in (-462, -460, 8810, 8821):
+                detail = f"网易云登录被风控拦截（错误码 {code}），请稍后重试或更换网络"
+            elif code is not None:
+                detail = f"获取网易云二维码密钥失败（错误码 {code}）"
+            else:
+                detail = "获取网易云二维码密钥失败"
+            raise _LoginStageError("unikey_response", f"{detail}，请改用 Cookie 导入", code=code)
         qr_url = f"{_NETEASE_QR_PREFIX}{unikey}"
         data_url = _render_qr(qr_url)
         if not data_url:
-            raise MusicError("二维码图片生成失败，请改用 Cookie 导入")
+            raise _LoginStageError("qrcode_render", "二维码图片生成失败，请改用 Cookie 导入")
         async with self._registry_lock:
             if self._closed or generation != self._generations["netease"]:
                 raise MusicError("登录会话已取消，请重新获取二维码")
@@ -601,25 +759,26 @@ class LoginManager:
     async def _poll_netease(self, task: _LoginTask) -> None:
         unikey = task.secret.get("unikey", "")
         if not unikey:
-            raise MusicError("二维码已失效，请重新获取")
-        form = self._netease_form({"key": unikey, "type": 1})
+            raise _LoginStageError("poll_request", "二维码已失效，请重新获取")
         async with self._client("netease") as client:
             try:
                 response = await client.post(
                     _NETEASE_BASE + _NETEASE_CHECK,
                     headers=self._netease_headers(),
-                    data=form,
+                    data=weapi_form({"key": unikey, "type": 1}),
                 )
             except Exception as exc:  # noqa: BLE001
                 raise fetch_error(exc) from None
         if response.status_code >= 400:
-            raise MusicError("网易云扫码状态查询失败，请稍后重试")
+            raise _LoginStageError(
+                "poll_http", "网易云扫码状态查询失败，请稍后重试", code=response.status_code
+            )
         try:
             body = response.json()
         except ValueError:
-            raise MusicError("网易云扫码状态无法解析，请重新获取二维码") from None
+            raise _LoginStageError("poll_response", "网易云扫码状态无法解析，请重新获取二维码") from None
         node = body if isinstance(body, dict) else {}
-        code = _int_of(node.get("code"), -1)
+        code = _safe_business_code(node.get("code"))
         if code == 800:
             task.state = _EXPIRED
             task.message = "二维码已过期，请重新发起登录"
@@ -637,30 +796,27 @@ class LoginManager:
         if code == 803:
             music_u = self._extract_music_u(node, response)
             if not music_u:
-                task.state = _FAILED
-                task.message = "登录成功但没拿到 MUSIC_U，请改用 Cookie 导入"
-                task.secret.clear()
-                return
+                raise _LoginStageError(
+                    "poll_credential", "网易云登录成功但未返回 MUSIC_U，请改用 Cookie 导入", code=code
+                )
             cookie = f"MUSIC_U={music_u}"
-            await self._persist_cookie(
-                "netease", cookie, task.cookie_fingerprint, task.generation
-            )
+            try:
+                await self._persist_cookie(
+                    "netease", cookie, task.cookie_fingerprint, task.generation
+                )
+            except MusicError as exc:
+                raise _LoginStageError("persist", str(exc)) from None
             task.state = _SUCCESS
             task.nickname = text_of(node.get("nickname"), task.nickname)
             task.message = "网易云音乐登录成功"
             task.secret.clear()
             return
-        task.state = _FAILED
-        task.message = self._with_hint("网易云扫码未完成")
-        task.secret.clear()
+        detail = f"网易云扫码未完成（错误码 {code}）" if code is not None else "网易云扫码响应无法确认"
+        raise _LoginStageError("poll_response", detail, code=code)
 
     @staticmethod
     def _netease_headers() -> dict[str, str]:
         return {"Referer": _NETEASE_BASE, "User-Agent": USER_AGENT}
-
-    @staticmethod
-    def _netease_form(payload: dict[str, Any]) -> dict[str, str]:
-        return weapi_form(payload)
 
     @staticmethod
     def _extract_music_u(body: dict[str, Any], response: httpx.Response) -> str:
@@ -707,7 +863,7 @@ class LoginManager:
     async def _poll_qq(self, task: _LoginTask) -> None:
         qrsig = task.secret.get("qrsig", "")
         if not qrsig:
-            raise MusicError("二维码已失效，请重新获取")
+            raise _QQStageError("qrcode", "二维码已失效，请重新获取")
         params = {
             "u1": "https://graph.qq.com/oauth2.0/login_jump",
             "ptqrtoken": str(hash33(qrsig)),
@@ -734,13 +890,17 @@ class LoginManager:
                 client.cookies.set("qrsig", qrsig)
                 response = await client.get(_QQ_POLL_URL, params=params, headers=headers)
             except Exception as exc:  # noqa: BLE001
-                raise fetch_error(exc) from None
+                raise _QQStageError("poll", str(fetch_error(exc))) from None
             text = response.text or ""
             if response.status_code >= 400:
-                raise MusicError("QQ 扫码状态查询失败，请稍后重试")
+                raise _QQStageError(
+                    "poll",
+                    f"QQ 扫码状态查询失败（HTTP {response.status_code}），请稍后重试",
+                    code=response.status_code,
+                )
             parts = self._parse_ptui_cb(text)
             if not parts:
-                raise MusicError(f"QQ 扫码状态无法解析，{_COOKIE_HINT}")
+                raise _QQStageError("poll", f"QQ 扫码状态无法解析，{_COOKIE_HINT}")
             code = _int_of(parts[0], -1)
             if code == 66:
                 task.state = _WAITING
@@ -764,18 +924,22 @@ class LoginManager:
             sig_url = text_of(parts[2])
             nick = text_of(parts[5], DEFAULT_QQ_NICK)
             if not sig_url:
-                raise MusicError(f"QQ 登录未返回跳转地址，{_COOKIE_HINT}")
+                raise _QQStageError("poll", f"QQ 登录未返回跳转地址，{_COOKIE_HINT}")
             credential = await self._exchange_mobile_credential(client, sig_url, nick)
         cookie = credential.to_cookie()
         if not cookie:
-            raise MusicError(f"QQ 音乐凭据不完整，{_COOKIE_HINT}")
-        await self._persist_cookie(
-            "qqmusic",
-            cookie,
-            task.cookie_fingerprint,
-            task.generation,
-            qq_credential=credential,
-        )
+            raise _QQStageError("credential", f"QQ 音乐凭据不完整，{_COOKIE_HINT}")
+        try:
+            await self._persist_cookie(
+                "qqmusic",
+                cookie,
+                task.cookie_fingerprint,
+                task.generation,
+                qq_credential=credential,
+            )
+        except MusicError as exc:
+            # 本地保存失败与上游拒绝必须能在后台日志里区分开。
+            raise _QQStageError("persist", str(exc)) from None
         task.state = _SUCCESS
         task.nickname = credential.nick or nick
         task.message = "登录成功，已绑定移动端凭据并启用自动保活"
@@ -789,11 +953,13 @@ class LoginManager:
         try:
             query = parse_qs(urlsplit(sig_url).query)
         except ValueError:
-            raise MusicError(f"QQ 登录跳转地址无效，{_COOKIE_HINT}") from None
+            raise _QQStageError("sig", f"QQ 登录跳转地址无效，{_COOKIE_HINT}") from None
         uin = text_of((query.get("uin") or [""])[0])
         ptsigx = text_of((query.get("ptsigx") or [""])[0])
         if not uin or not ptsigx:
-            raise MusicError("登录返回中缺少 uin 或 ptsigx 参数")
+            raise _QQStageError(
+                "sig", f"QQ 登录返回中缺少 uin 或 ptsigx 参数，{_COOKIE_HINT}"
+            )
         check_params = {
             "uin": uin,
             "pttype": "1",
@@ -814,54 +980,127 @@ class LoginManager:
             "pt_light": "0",
             "pt_3rd_aid": "100497308",
         }
+        check_headers = {**_QQ_HEADERS, "Referer": _QQ_LOGIN_REFERER}
         try:
-            await client.post(_QQ_CHECK_SIG_URL, params=check_params, headers=dict(_QQ_HEADERS))
-            p_skey = client.cookies.get("p_skey") or ""
-            authorize_params = {
-                "response_type": "code",
-                "client_id": "100497308",
-                "redirect_uri": "https://y.qq.com/portal/login.html",
-                "scope": "get_user_info,get_app_friends",
-                "state": "state",
-                "from_ptlogin": "1",
-                "src": "1",
-                "update_auth": "1",
-                "openapi": "1010_1030",
-                "g_tk": str(hash33(p_skey, 5381)),
-                "auth_time": str(int(time.time() * 1000)),
-                "ui": secrets.token_hex(16),
-            }
-            response = await client.post(
-                _QQ_AUTHORIZE_URL, params=authorize_params, headers=dict(_QQ_HEADERS)
+            sig_response = await client.get(
+                _QQ_CHECK_SIG_URL, params=check_params, headers=check_headers
             )
-            code = self._extract_oauth_code(response)
-            if not code:
-                raise MusicError("获取 OAuth code 授权码失败")
-            payload = {
-                "comm": {"tmeLoginType": 2},
-                "req": {
-                    "module": "QQConnectLogin.LoginServer",
-                    "method": "QQLogin",
-                    "param": {"code": code},
-                },
-            }
-            body = await client.post(_MUSICU_URL, headers=dict(_QQ_HEADERS), json=payload)
-            data = body.json()
-        except MusicError:
-            raise
         except httpx.HTTPError:
-            raise MusicError(f"换取 QQ 音乐凭据时网络异常，{_COOKIE_HINT}") from None
+            raise _QQStageError(
+                "check_sig", f"QQ 登录鉴权阶段网络异常，{_COOKIE_HINT}"
+            ) from None
+        if sig_response.status_code >= 400:
+            raise _QQStageError(
+                "check_sig",
+                f"QQ 登录鉴权被服务端拒绝（HTTP {sig_response.status_code}），{_COOKIE_HINT}",
+                code=sig_response.status_code,
+            )
+        # 优先使用本次 check_sig 响应下发的票据：CookieJar 里可能同时存在
+        # 多个域的 p_skey，直接 get 会抛 CookieConflict。
+        signal_cookies = self._response_cookies(sig_response)
+        p_skey = text_of(signal_cookies.get("p_skey")) or self._cookie_from_jar(
+            client.cookies, "p_skey"
+        )
+        if not p_skey:
+            raise _QQStageError(
+                "check_sig", f"QQ 登录未获取到 p_skey 鉴权票据，请重新扫码，{_COOKIE_HINT}"
+            )
+        # 把响应票据落到 .qq.com，authorize 域名才一定收得到；同名 host-only
+        # Cookie 不会被发往 graph.qq.com，也不会造成多域取值冲突。
+        for ticket_name, ticket_value in signal_cookies.items():
+            if ticket_name and ticket_value:
+                self._set_domain_cookie(client.cookies, ticket_name, ticket_value)
+        if not signal_cookies.get("p_skey"):
+            self._set_domain_cookie(client.cookies, "p_skey", p_skey)
+        p_uin = text_of(signal_cookies.get("p_uin")) or self._cookie_from_jar(
+            client.cookies, "p_uin"
+        )
+        if p_uin:
+            self._set_domain_cookie(client.cookies, "p_uin", p_uin)
+        authorize_data = {
+            "response_type": "code",
+            "client_id": "100497308",
+            "redirect_uri": _QQ_REDIRECT_URI,
+            "scope": "get_user_info,get_app_friends",
+            "state": "state",
+            "switch": "",
+            "from_ptlogin": "1",
+            "src": "1",
+            "update_auth": "1",
+            "openapi": "1010_1030",
+            "g_tk": str(hash33(p_skey, 5381)),
+            "auth_time": str(int(time.time() * 1000)),
+            "ui": secrets.token_hex(16),
+        }
+        try:
+            # 与参考实现一致，通过表单提交授权参数。
+            response = await client.post(
+                _QQ_AUTHORIZE_URL, data=authorize_data, headers=dict(_QQ_HEADERS)
+            )
+        except httpx.HTTPError:
+            raise _QQStageError(
+                "authorize", f"QQ 登录 OAuth 授权阶段网络异常，{_COOKIE_HINT}"
+            ) from None
+        if response.status_code >= 400:
+            raise _QQStageError(
+                "authorize",
+                f"QQ 登录 OAuth 授权被服务端拒绝（HTTP {response.status_code}），{_COOKIE_HINT}",
+                code=response.status_code,
+            )
+        code = self._extract_oauth_code(response)
+        if not code:
+            raise _QQStageError(
+                "authorize", f"QQ 登录 OAuth 授权未返回授权码，请重新扫码，{_COOKIE_HINT}"
+            )
+        payload = {
+            "comm": {"tmeLoginType": 2},
+            "req": {
+                "module": "QQConnectLogin.LoginServer",
+                "method": "QQLogin",
+                "param": {"code": code},
+            },
+        }
+        try:
+            body = await client.post(_MUSICU_URL, headers=dict(_QQ_HEADERS), json=payload)
+        except httpx.HTTPError:
+            raise _QQStageError(
+                "qqlogin", f"QQ 音乐登录服务网络异常，{_COOKIE_HINT}"
+            ) from None
+        if body.status_code >= 400:
+            raise _QQStageError(
+                "qqlogin",
+                f"QQ 音乐登录服务暂时不可用（HTTP {body.status_code}），{_COOKIE_HINT}",
+                code=body.status_code,
+            )
+        try:
+            data = body.json()
         except ValueError:
-            raise MusicError("解析移动端登录响应失败") from None
+            raise _QQStageError(
+                "qqlogin", f"QQ 音乐登录返回数据无法解析，{_COOKIE_HINT}"
+            ) from None
         req = data.get("req") if isinstance(data, dict) else None
         if not isinstance(req, dict):
-            raise MusicError("解析移动端登录响应失败")
-        if _int_of(req.get("code"), -1) != 0:
-            raise MusicError("QQ 音乐授权失败")
+            raise _QQStageError(
+                "qqlogin", f"QQ 音乐登录响应格式不符合预期，{_COOKIE_HINT}"
+            )
+        req_code = _int_of(req.get("code"), -1)
+        if req_code != 0:
+            raise _QQStageError(
+                "qqlogin",
+                self._qq_login_rejection(req_code),
+                code=req_code if req_code >= 0 else None,
+            )
         credential = req.get("data")
         if not isinstance(credential, dict) or not credential:
-            raise MusicError("未返回凭证数据")
-        return _parse_credential(credential, nick=nick, fallback_uin=uin)
+            raise _QQStageError(
+                "qqlogin", f"QQ 音乐登录未返回凭据数据，{_COOKIE_HINT}"
+            )
+        try:
+            return _parse_credential(credential, nick=nick, fallback_uin=uin)
+        except MusicError:
+            raise _QQStageError(
+                "credential", f"QQ 音乐登录凭据不完整，请重新扫码，{_COOKIE_HINT}"
+            ) from None
 
     @staticmethod
     def _extract_oauth_code(response: httpx.Response) -> str:
@@ -895,6 +1134,84 @@ class LoginManager:
         for raw in match.group(1).split(","):
             parts.append(raw.strip().strip("'\"").strip())
         return parts
+
+    @staticmethod
+    def _response_cookies(response: httpx.Response) -> dict[str, str]:
+        """把本次响应的 Set-Cookie 收成 name→value，不经过多域 CookieJar。"""
+        values: dict[str, str] = {}
+        for header in response.headers.get_list("set-cookie"):
+            pair = header.split(";", 1)[0]
+            key, sep, value = pair.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if sep and key and value:
+                values.setdefault(key, value)
+        return values
+
+    @staticmethod
+    def _set_domain_cookie(cookies: httpx.Cookies, name: str, value: str) -> None:
+        """把票据统一落到 ``.qq.com``，并清掉同名旧域值，避免重复 Cookie。"""
+        jar = getattr(cookies, "jar", None)
+        if jar is not None:
+            for cookie in [cookie for cookie in jar if cookie.name == name]:
+                jar.clear(cookie.domain, cookie.path, cookie.name)
+        cookies.set(name, value, domain=".qq.com")
+
+    @staticmethod
+    def _cookie_from_jar(cookies: httpx.Cookies, name: str) -> str:
+        """遍历 CookieJar 取票据，绕开 ``Cookies.get`` 的同名多域冲突。"""
+        jar = getattr(cookies, "jar", None)
+        if jar is None:
+            try:
+                return text_of(cookies.get(name))
+            except Exception:  # noqa: BLE001 - 冲突时按缺失处理
+                return ""
+        found: list[tuple[str, str]] = []
+        try:
+            for cookie in jar:
+                if cookie.name != name:
+                    continue
+                value = text_of(cookie.value)
+                if value:
+                    found.append((str(cookie.domain or "").lstrip("."), value))
+        except Exception:  # noqa: BLE001 - 坏 Cookie 不能中断登录
+            return ""
+        if not found:
+            return ""
+        for wanted in (
+            "ssl.ptlogin2.graph.qq.com",
+            "graph.qq.com",
+            "ptlogin2.qq.com",
+            "qq.com",
+        ):
+            for domain, value in found:
+                if domain == wanted or domain.endswith("." + wanted):
+                    return value
+        return found[0][1]
+
+    @staticmethod
+    def _qq_login_rejection(code: int) -> str:
+        """把已知上游整数码翻成安全文案，保留码值以区分服务端拒绝。"""
+        if code < 0:
+            return f"QQ 音乐登录未收到服务端结果，请稍后重试，{_COOKIE_HINT}"
+        known: dict[int, str] = {
+            1000: "QQ 音乐登录授权已失效，请重新扫码登录",
+            104400: "QQ 音乐登录授权已失效，请重新扫码登录",
+            104401: "QQ 音乐登录授权已失效，请重新扫码登录",
+            20261: "QQ 音乐登录参数错误，请重新扫码重试",
+            20271: "QQ 音乐登录验证码错误，请重新扫码重试",
+            20272: "QQ 音乐登录账号绑定异常，请稍后重试",
+            20274: "QQ 音乐登录缺少账号绑定，请稍后重试",
+            20277: "QQ 音乐登录账号受限，请稍后重试",
+            20278: "QQ 音乐登录账号受限，请稍后重试",
+            20279: "QQ 音乐登录失败：设备登录数已达上限，请先在 QQ音乐客户端的设备管理中清理旧设备后重试",
+            20450: "QQ 音乐登录失败：账号已被封禁",
+            104604: "QQ 音乐登录失败：操作过于频繁，请稍后重试",
+        }
+        base = known.get(code)
+        if base:
+            return f"{base}（{code}），{_COOKIE_HINT}"
+        return f"QQ 音乐登录被服务端拒绝（错误码 {code}），{_COOKIE_HINT}"
 
     @staticmethod
     def _cookie_from_response(response: httpx.Response, name: str) -> str:
@@ -948,18 +1265,23 @@ class LoginManager:
             if self._closed or generation != self._generations["qqmusic"]:
                 return self._refresh_cancelled(force)
             self._refresh_failures[fingerprint] = time.monotonic()
+            diagnostic = exc if isinstance(exc, _LoginStageError) else _QQStageError("refresh", str(exc))
+            _log_login_failure("qqmusic", diagnostic)
             return {"state": _FAILED, "message": self._with_hint(str(exc))}
         except Exception as exc:  # noqa: BLE001
             if self._closed or generation != self._generations["qqmusic"]:
                 return self._refresh_cancelled(force)
             self._refresh_failures[fingerprint] = time.monotonic()
+            _log_login_failure("qqmusic", _QQStageError("refresh_request", str(fetch_error(exc))))
             return {"state": _FAILED, "message": self._with_hint(str(fetch_error(exc)))}
         if self._closed or generation != self._generations["qqmusic"]:
             return self._refresh_cancelled(force)
         new_cookie = credential.to_cookie()
         if not new_cookie:
             self._refresh_failures[fingerprint] = time.monotonic()
-            return {"state": _FAILED, "message": "QQ 音乐续期未返回可用凭据"}
+            failure = _QQStageError("refresh_credential", "QQ 音乐续期未返回可用凭据")
+            _log_login_failure("qqmusic", failure)
+            return {"state": _FAILED, "message": self._with_hint(str(failure))}
         try:
             await self._persist_cookie(
                 "qqmusic",
@@ -972,6 +1294,8 @@ class LoginManager:
             if self._closed or generation != self._generations["qqmusic"]:
                 return self._refresh_cancelled(force)
             self._refresh_failures[fingerprint] = time.monotonic()
+            diagnostic = exc if isinstance(exc, _LoginStageError) else _QQStageError("refresh_persist", str(exc))
+            _log_login_failure("qqmusic", diagnostic)
             return {"state": _FAILED, "message": str(exc)}
         self._refresh_failures.pop(fingerprint, None)
         self._last_refresh_at = {_fingerprint(new_cookie): time.monotonic()}
@@ -985,51 +1309,80 @@ class LoginManager:
 
     async def _request_refresh(self, credential: QQMobileCredential) -> QQMobileCredential:
         """按 MusicUID 的 refresh 请求体重换一次 musickey。"""
+        login_type = credential.login_type
+        if login_type not in (1, 2):
+            raise _QQStageError("refresh_credentials", "QQ 音乐续期凭据的登录类型无法识别")
+        if not credential.refresh_token or not credential.musickey:
+            raise _QQStageError("refresh_credentials", "QQ 音乐续期凭据不完整，请重新扫码登录")
+        if login_type == 2:
+            musicid = _music_id_of(credential.musicid) or _music_id_of(credential.str_musicid)
+            if not musicid:
+                raise _QQStageError("refresh_credentials", "QQ 音乐续期凭据不完整，请重新扫码登录")
+            param = {
+                "openid": credential.openid,
+                "access_token": credential.access_token,
+                "refresh_token": credential.refresh_token,
+                "expired_in": credential.expired_at,
+                "musicid": int(musicid),
+                "musickey": credential.musickey,
+                "refresh_key": credential.refresh_key,
+                "loginMode": 2,
+            }
+        else:
+            str_musicid = _music_id_of(credential.str_musicid) or _music_id_of(credential.musicid)
+            if not str_musicid:
+                raise _QQStageError("refresh_credentials", "QQ 音乐续期凭据不完整，请重新扫码登录")
+            param = {
+                "openid": credential.openid,
+                "refresh_token": credential.refresh_token,
+                "str_musicid": str_musicid,
+                "musickey": credential.musickey,
+                "unionid": credential.unionid,
+                "refresh_key": credential.refresh_key,
+                "loginMode": 2,
+            }
         payload = {
-            "comm": {"ct": 11, "cv": "12080008", "tmeLoginType": 2},
+            "comm": {"ct": 11, "cv": "12080008", "tmeLoginType": login_type},
             "req": {
                 "module": "music.login.LoginServer",
                 "method": "Login",
-                "param": {
-                    "openid": credential.openid,
-                    "access_token": credential.access_token,
-                    "refresh_token": credential.refresh_token,
-                    "expired_in": credential.expired_at,
-                    "musicid": credential.musicid or credential.str_musicid,
-                    "musickey": credential.musickey,
-                    "refresh_key": credential.refresh_key,
-                    "loginMode": 2,
-                },
+                "param": param,
             },
         }
-        async with self._client("qqmusic") as client:
-            try:
+        try:
+            async with self._client("qqmusic") as client:
                 response = await client.post(_MUSICU_URL, headers=dict(_QQ_HEADERS), json=payload)
-            except Exception as exc:  # noqa: BLE001
-                raise fetch_error(exc) from None
-            if response.status_code >= 400:
-                raise MusicError("QQ 音乐续期服务暂时不可用，请稍后重试")
-            try:
-                body = response.json()
-            except ValueError:
-                raise MusicError("QQ 音乐续期返回数据格式不符合预期") from None
+        except Exception as exc:  # noqa: BLE001 - never echo raw transport exceptions
+            safe_error = fetch_error(exc)
+            raise _QQStageError("refresh_request", str(safe_error)) from None
+        if response.status_code >= 400:
+            raise _QQStageError(
+                "refresh_http", "QQ 音乐续期服务暂时不可用，请稍后重试", code=response.status_code
+            )
+        try:
+            body = response.json()
+        except (ValueError, UnicodeDecodeError):
+            raise _QQStageError("refresh_response", "QQ 音乐续期返回数据格式不符合预期") from None
         req = body.get("req") if isinstance(body, dict) else None
         if not isinstance(req, dict):
-            raise MusicError("返回数据格式不符合预期")
-        code = _int_of(req.get("code"), -1)
+            raise _QQStageError("refresh_response", "QQ 音乐续期返回数据格式不符合预期")
+        code = _safe_business_code(req.get("code"))
+        if code is None:
+            raise _QQStageError("refresh_response", "QQ 音乐续期未返回有效状态码")
         if code != 0:
-            raise MusicError("QQ 音乐续期失败")
+            if code == 20279:
+                message = f"QQ 音乐续期失败：设备登录数已达上限（错误码 {code}），请在 QQ 音乐客户端的设备管理中清理旧设备后重试"
+            elif code == 104604:
+                message = f"QQ 音乐续期失败：操作过于频繁（错误码 {code}），请稍后重试"
+            elif code in (1000, 104400, 104401):
+                message = f"QQ 音乐续期授权已失效（错误码 {code}），请重新扫码登录"
+            else:
+                message = f"QQ 音乐续期被服务端拒绝（错误码 {code}）"
+            raise _QQStageError("refresh_response", message, code=code)
         data = req.get("data")
         if not isinstance(data, dict) or not data:
-            raise MusicError("返回核心凭据为空")
-        if not text_of(data.get("musickey")):
-            raise MusicError("服务端未返回新凭据")
-        return _parse_credential(
-            data,
-            nick=credential.nick,
-            fallback_uin=credential.musicid or credential.str_musicid,
-            fallback_expires=credential.key_expires_in or DEFAULT_KEY_EXPIRES,
-        )
+            raise _QQStageError("refresh_response", "QQ 音乐续期返回了不完整结果", code=code)
+        return _merge_refreshed_credential(data, credential)
 
     @staticmethod
     def _needs_refresh(credential: QQMobileCredential) -> bool:

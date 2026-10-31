@@ -502,6 +502,8 @@ textarea.input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--
 /* 提示文字不参与挤压：让它自己换行，把宽度让给控件 */
 .field-body .field-hint { flex: 1 0 100%; min-width: 0; max-width: 760px; overflow-wrap: anywhere; }
 .field-hint { margin: 5px 0 0; font-size: 11.5px; color: var(--text-3); }
+/* 凭据页的获取指引带分步换行 */
+[data-cred-tip] { white-space: pre-line; }
 .unit { color: var(--text-3); font-size: 11.5px; flex: 0 0 auto; padding-top: 8px; }
 
 .secret-wrap { display: flex; gap: 6px; flex: 1; max-width: 460px; }

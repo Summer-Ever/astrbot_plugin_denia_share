@@ -138,13 +138,19 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
     {
         "key": "MUSIC_DEFAULT_PLATFORM", "group": "音乐设置", "label": "默认搜歌平台",
         "type": "select", "default": "both", "options": ["both", "netease", "qqmusic"],
-        "labels": ["两家一起搜", "网易云音乐", "QQ音乐"],
+        "labels": ["全部", "网易云音乐", "QQ音乐"],
         "hint": "也可以在指令里指定，例如：搜歌 QQ 晴天。",
+    },
+    {
+        "key": "MUSIC_QUALITY", "group": "音乐设置", "label": "点歌音质",
+        "type": "select", "default": "high", "options": ["standard", "high", "lossless"],
+        "labels": ["标准（128k）", "较高（320k，默认）", "无损（FLAC，需会员权益）"],
+        "hint": "点歌取流尝试的最高音质，拿不到时自动降档。无损需要账号权益（网易云 VIP / QQ音乐绿钻），匿名或免费账号会自动退到较低档。",
     },
     {
         "key": "MUSIC_SEARCH_LIMIT", "group": "音乐设置", "label": "搜歌结果数量",
         "type": "int", "default": 5, "min": 1, "max": 10,
-        "hint": "结果卡片最多显示这些候选；两家一起搜时交错排列，编号连续。",
+        "hint": "结果卡片最多显示这些候选；全部时两家交错排列，编号连续。",
     },
     {
         "key": "MUSIC_SESSION_TTL_SECONDS", "group": "音乐设置", "label": "选歌列表有效期",
@@ -416,9 +422,9 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "label": "音频发送方式",
         "type": "select",
         "default": "voice",
-        "options": ["voice", "file", "voice_fallback_file"],
-        "labels": ["语音条", "音频文件", "语音条（失败后发送文件）"],
-        "hint": "仅在富媒体开启时生效。音频文件保留原格式；失败兜底仅针对发送接口报错或明确返回失败，无法检测接口成功但客户端未收到的情况。超时也会尝试文件，可能同时收到语音和文件。",
+        "options": ["voice", "file"],
+        "labels": ["语音条", "音频文件"],
+        "hint": "语音条发送失败时自动改发音频文件；音频文件则直接发文件。超时可能导致语音和文件同时送达；接口返回成功但客户端未收到时无法检测。分容器发送文件可使用中转、共享目录或宿主路径映射。",
     },
     {
         "key": "SEND_BACKGROUND_MUSIC",
@@ -1039,6 +1045,16 @@ def migrate_music_commands(config: Any) -> bool:
     return changed
 
 
+def migrate_audio_send_mode(config: Any) -> bool:
+    """旧 third 选项 voice_fallback_file 并入 voice：语音条本就失败后转文件。"""
+    changed = False
+    for container in (config.get("媒体发送"), config):
+        if isinstance(container, dict) and container.get("AUDIO_SEND_MODE") == "voice_fallback_file":
+            container["AUDIO_SEND_MODE"] = "voice"
+            changed = True
+    return changed
+
+
 def migrate_grouped_config(config: Any) -> bool:
     """旧版扁平配置 → 分组配置，幂等。"""
     changed = False
@@ -1365,6 +1381,9 @@ class ParserConfig:
     def MUSIC_DEFAULT_PLATFORM(self) -> str:
         return self._cfg_get("MUSIC_DEFAULT_PLATFORM", "both")
 
+    def MUSIC_QUALITY(self) -> str:
+        return str(self._cfg_get("MUSIC_QUALITY", "high"))
+
     @property
     def MUSIC_SEARCH_LIMIT(self) -> int:
         return self._cfg_get("MUSIC_SEARCH_LIMIT", 5)
@@ -1543,7 +1562,7 @@ class ParserConfig:
     def AUDIO_SEND_MODE(self) -> str:
         """音频发送方式；不支持的配置值沿用默认语音条。"""
         value = str(self._cfg_get("AUDIO_SEND_MODE", "voice") or "").strip()
-        return value if value in ("voice", "file", "voice_fallback_file") else "voice"
+        return value if value in ("voice", "file") else "voice"
 
     @property
     def SEND_BACKGROUND_MUSIC(self) -> bool:

@@ -297,6 +297,7 @@ class DeniaSharePlugin(Star):
 
         try:
             from .core.config import (
+                migrate_audio_send_mode,
                 migrate_grouped_config,
                 migrate_music_commands,
                 migrate_output_modes,
@@ -316,6 +317,7 @@ class DeniaSharePlugin(Star):
             changed = migrate_output_modes(config) or changed
             changed = migrate_music_commands(config) or changed
             changed = migrate_grouped_config(config) or changed
+            changed = migrate_audio_send_mode(config) or changed
             if changed:
                 save = getattr(config, "save_config", None)
                 if callable(save):
@@ -848,15 +850,36 @@ class DeniaSharePlugin(Star):
     async def _refresh_music_account(self, platform):
         await self._get_music_controller()._refresh(platform)
 
-    @filter.regex(r"(?s)^.*$")
+    @filter.command("点歌", priority=10)
+    async def music_search_command(self, event: AstrMessageEvent):
+        """点歌 歌名：发送带编号的搜索卡片。"""
+        async for output in self.music_commands_handler(event):
+            yield output
+
+    @filter.command("听", priority=10)
+    async def music_play_command(self, event: AstrMessageEvent):
+        """听 N：播放上一次搜索结果中的第 N 首。"""
+        async for output in self.music_commands_handler(event):
+            yield output
+
+    @filter.regex(r"(?s)^.*$", priority=10)
     async def music_commands_handler(self, event: AstrMessageEvent, matched: re.Match | None = None):
         """点歌 歌名显示本插件搜歌卡片，听1 按编号发送音频。"""
         from .core.music.controller import music_command
         selected = music_command(event.message_str)
         if selected is None or self._has_json_component(event):
             return
-        async for output in self._get_music_controller().handle(event, *selected):
-            yield output
+        if self._access_denied(event):
+            return
+        # 搜索卡片通过 context 主动投递，不会设置宿主的“已发送”标记。
+        # 命中后先认领事件，避免搜索/选歌继续落入 LLM 或其他命令入口。
+        event.stop_event()
+        try:
+            async for output in self._get_music_controller().handle(event, *selected):
+                yield output
+        finally:
+            # 兼容停止标记存放于 result 的宿主版本：yield 可能替换 result。
+            event.stop_event()
 
     @filter.regex(r".*")
     async def json_card_handler(self, event: AstrMessageEvent, matched: re.Match | None = None):
@@ -2103,7 +2126,7 @@ class DeniaSharePlugin(Star):
                     yield [Comp.Video.fromURL(url)]
                 else:
                     yield [Comp.Video.fromFileSystem(str(path))]
-            elif pconfig.AUDIO_SEND_MODE == "voice_fallback_file":
+            elif pconfig.AUDIO_SEND_MODE == "voice":
                 yield _AudioFallbackItem(result, path)
             else:
                 yield [await self._build_audio_component(
@@ -2119,15 +2142,22 @@ class DeniaSharePlugin(Star):
         callback_base: str,
         ttl: int,
     ) -> bool:
-        """优先发送语音，接口失败时仅尝试一次文件兜底。"""
+        """优先发送语音，接口失败时仅尝试一次文件兜底。
+
+        这里的发送是主动 ``event.send``，不经过宿主 RespondStage，所以
+        RespondStage 的文件路径映射不会自动生效，需要在这条路径上自行补上。
+        """
         for mode in ("voice", "file"):
             try:
                 component = await self._build_audio_component(
                     result, path, relay_enabled, callback_base, ttl, mode=mode
                 )
+                self._apply_audio_path_mapping(event, component)
                 sent = await event.send(event.chain_result([component]))
                 if sent is False:
                     raise RuntimeError("音频发送接口返回失败")
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 if mode == "voice":
                     logger.warning(
@@ -2139,6 +2169,53 @@ class DeniaSharePlugin(Star):
                 logger.debug(f"[denia_share] 音频发送接口已接受: mode={mode}")
                 return True
         return False
+
+    def _path_mapping_rules(self, event: AstrMessageEvent) -> list:
+        """读取当前会话在宿主配置里的 ``platform_settings.path_mapping``。"""
+        get_host_config = getattr(self.context, "get_config", None)
+        if not callable(get_host_config):
+            return []
+        host_config = get_host_config(event.unified_msg_origin)
+        if host_config is None:
+            return []
+        settings = host_config.get("platform_settings") or {}
+        rules = settings.get("path_mapping") or []
+        if not rules:
+            return []
+        if not isinstance(rules, (list, tuple)):
+            raise ValueError(
+                f"path_mapping 应为列表，实际为 {type(rules).__name__}"
+            )
+        return list(rules)
+
+    def _apply_audio_path_mapping(self, event: AstrMessageEvent, component) -> None:
+        """主动发送前按宿主逻辑映射本地 ``Comp.File`` 的路径。
+
+        URL 中转与 Record 都不需要映射；没有规则时保留原路径。映射本身
+        失败时直接抛出，让本次发送按失败处理 —— 不能把协议端读不到的
+        容器内路径当成发送成功。
+        """
+        file_cls = getattr(Comp, "File", None)
+        if file_cls is None or not isinstance(component, file_cls):
+            return
+        if getattr(component, "url", ""):
+            return
+        local_path = getattr(component, "file", "")
+        if not local_path:
+            return
+        rules = self._path_mapping_rules(event)
+        if not rules:
+            return
+        # 延迟导入：离线单测的 astrbot 是轻量桩，宿主没装全时不能让插件
+        # 顶层 import 失败；只有真的要映射时才需要宿主工具。
+        try:
+            from astrbot.core.utils.path_util import path_Mapping
+        except ImportError as exc:
+            raise RuntimeError("宿主缺少文件路径映射工具") from exc
+        mapped = path_Mapping(rules, str(local_path))
+        if not isinstance(mapped, str) or not mapped:
+            raise RuntimeError("宿主文件路径映射返回了空路径")
+        component.file = mapped
 
     async def _build_audio_component(
         self,

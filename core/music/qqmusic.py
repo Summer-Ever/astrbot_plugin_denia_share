@@ -24,18 +24,35 @@ from .client import (
     safe_media_url,
     text_of,
 )
+from .crypto import hash33
 from .models import MusicError, PlayURL, Song
 
 MUSICU_URL: Final[str] = "https://u.y.qq.com/cgi-bin/musicu.fcg"
 DETAIL_URL: Final[str] = "https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg"
+# 账号判活用个人主页端点：服务端按 Cookie 密钥鉴权（无效必回 1000）。
+HOMEPAGE_URL: Final[str] = "https://c6.y.qq.com/rsc/fcg_get_profile_homepage.fcg"
 SEARCH_MODULE: Final[str] = "music.search.SearchCgiService"
 SEARCH_METHOD: Final[str] = "DoSearchForQQMusicDesktop"
 COVER_URL: Final[str] = "https://y.qq.com/music/photo_new/T002R300x300M000{}.jpg"
 SONG_URL: Final[str] = "https://y.qq.com/n/ryqq/songDetail/{}"
 
 HEADERS: Final[dict[str, str]] = {"Referer": "https://y.qq.com/portal/player.html"}
-# 先试 320kbps mp3，匿名或免费曲目拿不到时退到 m4a
-QUALITY_TIERS: Final[tuple[tuple[str, str], ...]] = (("M800", "mp3"), ("C400", "m4a"))
+# 点歌音质（MUSIC_QUALITY）：设定「尝试的最高档」，拿不到自动降一档。
+# F000=FLAC 无损（需要账号权益），M800=320kbps mp3（默认），C400=128k m4a。
+_QUALITY_TIERS: Final[dict[str, tuple[tuple[str, str], ...]]] = {
+    "standard": (("C400", "m4a"),),
+    "high": (("M800", "mp3"), ("C400", "m4a")),
+    "lossless": (("F000", "flac"), ("M800", "mp3"), ("C400", "m4a")),
+}
+QUALITY_TIERS: Final[tuple[tuple[str, str], ...]] = _QUALITY_TIERS["high"]
+
+
+def _quality_tiers() -> tuple[tuple[str, str], ...]:
+    """按配置的音质档返回尝试顺序；未识别的值回退默认。"""
+    from ..config import get_config
+
+    value = str(get_config().current_values().get('MUSIC_QUALITY', 'high') or 'high')
+    return _QUALITY_TIERS.get(value.strip().lower(), _QUALITY_TIERS["high"])
 # 取流固定 guid；登录态缺失或曲目权限不足时服务端返回该 code
 LOGIN_REQUIRED: Final[int] = 104003
 GUID: Final[str] = "10000"
@@ -182,7 +199,7 @@ class QQMusicProvider(BaseProvider):
         uin = self._uin()
         headers = self._headers()
         last_code = 0
-        for prefix, suffix in QUALITY_TIERS:
+        for prefix, suffix in _quality_tiers():
             payload = {
                 "req_1": {
                     "module": "vkey.GetVkeyServer",
@@ -217,29 +234,54 @@ class QQMusicProvider(BaseProvider):
         return PlayURL(message='暂时无法取得这首歌的音频，可能受到会员或版权限制')
 
     async def check_login(self) -> dict[str, str]:
-        if not self.cookie or not cookie_value(self.cookie, "uin"):
-            return {"status": "invalid", "message": "未配置 QQ 音乐 Cookie"}
-        # Playback endpoints also return code=0 for anonymous / stale accounts;
-        # a successful request alone must never label a Cookie valid.
-        payload = {
-            "req_1": {
-                "module": "vkey.GetVkeyServer",
-                "method": "CgiGetVkey",
-                "param": {
-                    "filename": ["M800003OUlho2HcRHC.mp3"],
-                    "guid": GUID,
-                    "songmid": ["003OUlho2HcRHC"],
-                    "songtype": [0],
-                    "uin": self._uin(),
-                    "loginflag": 1,
-                    "platform": "20",
-                },
-            },
-            "loginUin": self._uin(),
-            "comm": {"uin": self._uin(), "format": "json", "ct": 24, "cv": 0},
+        expected_uin = cookie_value(self.cookie, "uin")
+        authst = cookie_value(self.cookie, "qm_keyst") or cookie_value(self.cookie, "qqmusic_key")
+        if (
+            not self.cookie
+            or not expected_uin
+            or not expected_uin.isdigit()
+            or len(expected_uin) > 20
+            or not authst
+        ):
+            return {"status": "invalid", "message": "未配置 QQ 音乐登录凭据"}
+        # 判活端点选型（2026-11-01 真机实测）：GetLoginUserInfo 对鉴权完全不敏感
+        # （空/垃圾 authst 也回 code 0 与全量资料），响应体也不含 uin/musicid，
+        # 没有判别力；个人主页端点则密钥无效/缺失必回 1000、有效回 0，是唯一
+        # 明确区分有效与失效的账号端点。身份一致性交由服务端按 Cookie 密钥鉴权，
+        # 返回的昵称展示给用户自行核对。
+        params: dict[str, Any] = {
+            "g_tk": str(hash33(authst, 5381)),
+            "format": "json",
+            "inCharset": "utf-8",
+            "outCharset": "utf-8",
+            "notice": "0",
+            "cid": "205360838",
+            "needNewCode": "0",
+            "loginUin": expected_uin,
+            "hostUin": "0",
+            "userid": expected_uin,
+            "reqfrom": "1",
         }
-        body = await self._post_musicu(payload, "QQ 音乐账号状态")
-        return {"status": "unknown", "message": "凭据已保存，暂时无法确认登录状态，可尝试点歌验证"}
+        try:
+            body = as_dict(
+                await self._request_json(
+                    "GET", HOMEPAGE_URL, headers=self._headers(), params=params,
+                    what="QQ 音乐账号状态",
+                )
+            )
+        except MusicError:
+            return {"status": "unknown", "message": "凭据已保存，暂时无法确认登录状态"}
+        code = body.get("code")
+        if type(code) is not int:
+            return {"status": "unknown", "message": "凭据已保存，暂时无法确认登录状态"}
+        if code in (1000, 104400, 104401):
+            return {"status": "invalid", "message": "QQ 音乐服务端确认登录态已失效"}
+        if code != 0:
+            return {"status": "unknown", "message": "凭据已保存，暂时无法确认登录状态"}
+        nick = text_of(as_dict(as_dict(body.get("data")).get("creator")).get("nick"))
+        if nick:
+            return {"status": "valid", "message": f"QQ 音乐登录态有效（昵称 {nick}）"}
+        return {"status": "valid", "message": "QQ 音乐登录态有效"}
 
 
 __all__ = ["QQMusicProvider", "SONG_URL", "LOGIN_REQUIRED"]
