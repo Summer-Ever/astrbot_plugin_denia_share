@@ -1941,46 +1941,38 @@ class DeniaSharePlugin(Star):
     ) -> list[str]:
         """把图片列表组装成若干条 Markdown 文本。
 
-        - 第一段带平台/作者/标题头信息，后续消息不再重复
+        - **只包含图片**：不带头信息（平台/作者/标题），不带图片标签文字，
+          QQ 端看到的就是纯图片网格
         - 每行 ``MARKDOWN_IMAGE_PER_ROW`` 张，行内用空格分隔实现并排
         - 超过 ``MARKDOWN_IMAGE_MAX_PER_MSG`` 时按顺序切分，不重不漏
+        - 末尾带一行弱化的引用小字，说明 QQ 保存去重误判的处理方式
         """
         pconfig = get_config()
         per_msg = pconfig.MARKDOWN_IMAGE_MAX_PER_MSG
         per_row = pconfig.MARKDOWN_IMAGE_PER_ROW
 
-        header = result.platform.display_name if result.platform else ""
-        if result.author:
-            header += f" @{result.author.name}"
-        if result.title:
-            header += f" | {result.title}"
-
         messages: list[str] = []
         for offset in range(0, len(images), per_msg):
             chunk = images[offset : offset + per_msg]
             lines: list[str] = []
-            if offset == 0 and header:
-                lines.append(header)
-
             for row_start in range(0, len(chunk), per_row):
                 row = chunk[row_start : row_start + per_row]
                 cells: list[str] = []
-                for idx, image in enumerate(row, start=offset + row_start + 1):
+                for _idx, image in enumerate(row, start=offset + row_start + 1):
                     url = image.url
-                    # alt 里的方括号会提前闭合 Markdown 图片语法，换成全角
-                    label = (image.alt or f"图片 {idx}")
-                    label = label.replace("[", "（").replace("]", "）")
-                    label = label.replace("\n", " ").strip() or f"图片 {idx}"
                     width, height = await self._resolve_markdown_size(image)
                     # QQ 官方机器人要求 Markdown 图片带 `#宽px #高px`，
-                    # 缺了这段 QQ 只会把 "[图片 1]" 当成链接文字渲染，
-                    # 群里看到的就是一堆 "[image]"，图片根本不出来。
-                    cells.append(
-                        f"![{label} #{width}px #{height}px]({url})"
-                    )
+                    # 缺了这段 QQ 只会把图片当链接文字渲染。标签文字留空
+                    # （一个空格占位），QQ 就只渲染图片本身不出文字。
+                    cells.append(f"![ #{width}px #{height}px]({url})")
                 lines.append(" ".join(cells))
 
             messages.append("\n\n".join(lines))
+
+        if messages:
+            # QQ 对整条 markdown 消息的保存去重有误判（提示「已保存」但
+            # 实际没存），在末尾用块引用（弱化的灰色小字）提示用户处理方式。
+            messages[-1] += "\n\n> 保存时若提示已保存，直接点击再次保存即可"
 
         return messages
 
