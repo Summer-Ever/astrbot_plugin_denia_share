@@ -2,6 +2,8 @@
 
 一个 AstrBot 链接解析插件。在聊天里发送分享链接，就能查看内容卡片，并接收可用的视频或图片。平台开关、解析记录、卡片样式和配置都可以在自带的管理页面里调整。
 
+> **关于本仓库**：这是 [xiaoxi2760/希望解析器](https://github.com/xiaoxi2760/astrbot_plugin_denia_share) 的修改版，仅将多图图集的发送方式改为 QQ Markdown 渲染，详见 [MODIFICATIONS.md](MODIFICATIONS.md)。
+
 ## 功能
 
 - **自动解析分享链接**：支持单独的链接、含链接的分享口令，以及 QQ 小程序分享卡片。
