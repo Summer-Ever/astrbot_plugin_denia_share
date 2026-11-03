@@ -1971,8 +1971,11 @@ class DeniaSharePlugin(Star):
 
         if messages:
             # QQ 对整条 markdown 消息的保存去重有误判（提示「已保存」但
-            # 实际没存），在末尾用块引用（弱化的灰色小字）提示用户处理方式。
-            messages[-1] += "\n\n> 保存时若提示已保存，直接点击再次保存即可"
+            # 实际没存），在末尾用块引用（弱化的灰色小字）提示处理方式。
+            # 文案由配置项 MARKDOWN_IMAGE_HINT_TEXT 提供，留空则不显示。
+            hint = pconfig.MARKDOWN_IMAGE_HINT_TEXT
+            if hint:
+                messages[-1] += f"\n\n> {hint}"
 
         return messages
 

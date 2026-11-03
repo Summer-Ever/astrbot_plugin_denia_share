@@ -33,6 +33,7 @@
 | `MARKDOWN_IMAGE_PER_ROW` | 每行并排图片数 |
 | `MARKDOWN_IMAGE_WIDTH` / `MARKDOWN_IMAGE_HEIGHT` | 图片显示尺寸上限 |
 | `MARKDOWN_IMAGE_SIZE_MODE` | 尺寸模式（auto / 固定） |
+| `MARKDOWN_IMAGE_HINT_TEXT` | 图集末尾提示文案（留空不显示） |
 
 配置同步维护在 `CONFIG_META`（`core/config.py`）与 `_conf_schema.json` 两处，通过 `verify_schema_alignment` 自检保证一致。
 
@@ -50,7 +51,8 @@
 
 - Markdown 图集消息不再携带头部信息（平台 / 作者 / 标题），只输出纯图片网格
 - 图片标签文字（alt）留空占位，QQ 端只渲染图片本身，不再显示大字号标签
-- 消息末尾追加一行块引用小字，说明 QQ 保存去重误判的处理方式：
+- 消息末尾追加一行块引用小字，说明 QQ 保存去重误判的处理方式（文案可在插件 WebUI
+  的「合并转发 → 图集末尾提示文案」里改，留空则不显示）：
 
   > 保存时若提示已保存，直接点击再次保存即可
 

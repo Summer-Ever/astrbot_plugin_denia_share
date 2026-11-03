@@ -778,6 +778,18 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
             "本地图片读不到尺寸时回退到固定宽高"
         ),
     },
+    {
+        "key": "MARKDOWN_IMAGE_HINT_TEXT",
+        "group": "合并转发",
+        "label": "图集末尾提示文案",
+        "type": "string",
+        "default": "若提示已保存，点击再次保存即可",
+        "hint": (
+            "显示在 Markdown 图集最后一条消息末尾的一行弱化小字。"
+            "QQ 保存多图消息时会把后面的图误报成「已保存」且实际没存，"
+            "这行字用来提醒用户再点一次保存。留空则不显示任何提示"
+        ),
+    },
     # ---------------- 高级设置 ---------------- #
     {
         "key": "XIAOHEIHE_CK", "group": "高级设置", "subgroup": "平台凭据",
@@ -1768,6 +1780,19 @@ class ParserConfig:
         """
         value = str(self._cfg_get("MARKDOWN_IMAGE_SIZE_MODE", "auto") or "").strip().lower()
         return value if value in ("auto", "fixed") else "auto"
+
+    @property
+    def MARKDOWN_IMAGE_HINT_TEXT(self) -> str:
+        """Markdown 图集末尾的提示文案，留空表示不显示。
+
+        单行渲染在块引用里，换行会被压成空格；超长文案截断，避免把
+        消息撑得很难看。
+        """
+        value = str(
+            self._cfg_get("MARKDOWN_IMAGE_HINT_TEXT", "若提示已保存，点击再次保存即可") or ""
+        )
+        value = " ".join(value.split())
+        return value[:80]
 
     def should_send_markdown_images(self, image_count: int) -> bool:
         """这次是否改用 Markdown 集中展示图片。
