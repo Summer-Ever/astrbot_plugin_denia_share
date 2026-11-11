@@ -6,6 +6,7 @@
 
 import os
 import re
+import json
 import asyncio
 import hashlib
 import shutil
@@ -462,18 +463,129 @@ async def extract_video_first_frame(video_path: Path) -> Path:
 COMPRESS_CONCURRENCY = 2
 _compress_slots = asyncio.Semaphore(COMPRESS_CONCURRENCY)
 
-# 720p 目标：**短边压到 ≤720** —— 横屏把高度压到 ≤720（如 1920x1080 → 1280x720），
-# 竖屏把宽度压到 ≤720（抖音常见的 1080x1920 → 720x1280）。
-# min(...) 保证**只缩不放**：源本来就低于 720p 时保持原分辨率。
-_COMPRESS_VF = (
-    "scale='if(gt(iw,ih),-2,floor(min(720,iw)/2)*2)':"
-    "'if(gt(iw,ih),floor(min(720,ih)/2)*2,-2)'"
-)
+# 目标体积留 6% 余量：MP4 容器开销 + x264 单遍 ABR 的过冲都吃这点空间，
+# 贴着阈值编码很容易压出一个「刚好超一点」的文件，等于白转码一遍。
+_COMPRESS_SAFETY = 0.94
 
-# 逐级加压的 CRF 档位。先给视觉上几乎无损的 25，仍超阈值再退到 30；
-# 再往上画质损失就明显了 —— 两轮之后宁可发一个大一点的文件，也不把
-# 糊成马赛克的视频塞给用户。
+# 音频码率取不到时的估算值（抖音音轨普遍 128k AAC）。
+_DEFAULT_AUDIO_BPS = 128_000
+
+# 音频最多占总码率预算的比例。**音频优先原流复制**，只有长视频把预算摊薄到
+# 「光音轨就装不下」时才按这个上限降码率重编码 —— 体积达标是硬要求，
+# 音质是尽量项：326s 的 128k 音轨自己就占 5.2MB，5MB 阈值下复制必然超限。
+_AUDIO_BUDGET_RATIO = 0.25
+_MIN_AUDIO_BPS = 32_000
+
+# 视频码率下限：低于它画面已经没法看，但**体积达标优先**，所以这个值压得很低，
+# 画质由 _target_short_side 降分辨率来兜（360p 承载低码率远比 720p 划算）。
+_MIN_VIDEO_BPS = 60_000
+
+# 无时长信息时退回的 CRF 档位（探测失败才会用到）。
 _COMPRESS_CRF_STEPS = (25, 30)
+
+
+def _scale_filter(short_side: int) -> str:
+    """短边压到 ≤short_side，**只缩不放**。
+
+    横屏（iw>ih）短边是高，竖屏短边是宽 —— 抖音常见的 1080x1920 会压成
+    720x1280，而不是把宽压到 720 却把高留成 1920。floor(.../2)*2 保证偶数，
+    libx264 的 yuv420p 不接受奇数边长。
+    """
+    return (
+        f"scale='if(gt(iw,ih),-2,floor(min({short_side},iw)/2)*2)':"
+        f"'if(gt(iw,ih),floor(min({short_side},ih)/2)*2,-2)'"
+    )
+
+
+def _target_short_side(video_bps: int) -> int:
+    """按视频码率预算挑分辨率：预算够就守住 720p，不够才降。
+
+    720p 是用户要的目标，所以门槛压得很低（300k）—— 只有长视频把预算
+    摊到实在撑不起 720p 时才退到 540p / 360p，宁可小一点也不要满屏马赛克。
+    """
+    if video_bps >= 300_000:
+        return 720
+    if video_bps >= 150_000:
+        return 540
+    return 360
+
+
+async def _probe_media(path: Path) -> tuple[float, int] | None:
+    """探测 (时长秒, 音频码率 bps)。拿不到时长就返回 None。
+
+    时长是**按体积反推码率**的唯一依据，没有它就只能退回 CRF 档位（而 CRF
+    不保证体积上限）。ffprobe 与 ffmpeg 同包发行，缺失属于少数环境。
+    """
+    if shutil.which("ffprobe") is None:
+        return None
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration:stream=codec_type,bit_rate",
+        "-of", "json", str(path),
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        stdout, _ = await process.communicate()
+    except BaseException:
+        await _terminate_process(process)
+        raise
+    if process.returncode != 0:
+        return None
+    try:
+        info = json.loads(stdout.decode("utf-8", "replace"))
+        duration = float(info.get("format", {}).get("duration") or 0)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if duration <= 0:
+        return None
+    audio_bps = 0
+    for stream in info.get("streams") or []:
+        if stream.get("codec_type") != "audio":
+            continue
+        try:
+            audio_bps = int(stream.get("bit_rate") or 0)
+        except (TypeError, ValueError):
+            audio_bps = 0
+        break
+    return duration, audio_bps or _DEFAULT_AUDIO_BPS
+
+
+async def _compress_encode(
+    src: Path,
+    dst: Path,
+    *,
+    vf: str,
+    video_args: list[str],
+    audio_args: list[str],
+) -> bool:
+    """转码一遍，成功返回 True。失败清掉残缺输出再返回 False。
+
+    残缺文件必须先清：它顶着 ``.part`` 名不会被当产物复用，但留着会白占磁盘。
+    取消（CancelledError 不是 Exception 子类）原样上抛，不能吞。
+    """
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast",
+        *video_args,
+        *audio_args,
+        "-movflags", "+faststart",
+        str(dst),
+    ]
+    try:
+        await exec_ffmpeg_cmd(cmd)
+    except Exception:
+        await safe_unlink(dst)
+        return False
+    except BaseException:
+        await safe_unlink(dst)
+        raise
+    return True
 
 
 async def compress_video_if_needed(video_path: Path, threshold_mb: float) -> Path:
@@ -482,16 +594,24 @@ async def compress_video_if_needed(video_path: Path, threshold_mb: float) -> Pat
     用途：抖音大视频直发 QQ 常因文件过大被协议端拒绝。阈值由调用方传入
     （配置 ``DOUYIN_COMPRESS_SIZE_MB``，0 = 不压缩）。
 
+    **为什么不能只降分辨率 + 定 CRF**：抖音大量视频本身就是 720p，缩分辨率
+    是空操作；而 CRF 是「定质量」模式，输出体积完全由内容复杂度决定，**没有
+    任何上限保证**。实测一条 142MB / 326s 的 1280x720 抖音原片，crf=25 压出来
+    是 173MB（比原片还大），crf=30 仍有 115MB —— 转码三分半钟，阈值 30MB 一点
+    没靠近。所以这里改成**按阈值和时长反推目标码率**，用 maxrate/bufsize 给
+    体积封顶，CRF 只作为质量上限（capped CRF）：内容简单时省码率，复杂时撞顶。
+
     设计要点：
 
     - **产物缓存**：输出固定为 ``<原名>_720p.mp4``。同一链接再次解析时，
-      原始文件命中下载缓存 → 体积检查 → 压缩产物已存在 → 直接复用，
-      不会重复转码，也不用重新下载。原文件保留（不删）：删了会导致下次
-      解析重新走一遍 CDN 下载，还可能撞上风控。
+      原始文件命中下载缓存 → 体积检查 → 压缩产物已存在且达标 → 直接复用。
+      原文件保留（不删）：删了会导致下次解析重新走一遍 CDN 下载，还可能撞风控。
+      阈值被调低后旧产物不再达标，会被清掉重压，而不是一直发超限文件。
     - **失败降级**：没装 ffmpeg / 转码失败 / 压缩产物反而更大时，一律返回
       原文件 —— 压缩是锦上添花，绝不能让它把「本来能发出去的视频」变成失败。
     - **音频**：``-c:a copy`` 直接复制音频流（抖音音轨是 AAC，MP4 容器装得下），
       音质零损失；个别编码装不进 MP4 时退回 AAC 192k 重编码，仍属高质量。
+      音频码率会从总预算里先扣掉，剩下的才分给视频。
 
     Returns:
         压缩产物的路径，或（未压缩/压缩失败/产物更大时的）原路径。
@@ -508,7 +628,13 @@ async def compress_video_if_needed(video_path: Path, threshold_mb: float) -> Pat
 
     output_path = video_path.with_name(f"{video_path.stem}_720p.mp4")
     if output_path.exists():
-        return output_path
+        try:
+            cached_size = output_path.stat().st_size
+        except OSError:
+            cached_size = 0
+        if cached_size <= limit_bytes:
+            return output_path
+        await safe_unlink(output_path)
 
     if not ffmpeg_available():
         logger.warning(
@@ -522,93 +648,130 @@ async def compress_video_if_needed(video_path: Path, threshold_mb: float) -> Pat
         f"开始压缩到 720p: {video_path.name}"
     )
 
-    best_path: Path | None = None
-    best_size = original_size
+    probe = await _probe_media(video_path)
+    target_bytes = int(limit_bytes * _COMPRESS_SAFETY)
+    # 每档产物先留在 .part 名上，最后只提交选中的那一份，其余清掉。
+    results: list[tuple[Path, int, str]] = []
+
     async with _compress_slots:
         # 双重检查：等槽的时候另一条协程可能已经把同一产物转完了
         if output_path.exists():
             return output_path
-        for crf in _COMPRESS_CRF_STEPS:
-            # 每档写**独立临时名**：失败只清自己的残缺输出，不会毁掉上一档
-            # 已经成功（只是仍超限）的产物；正式名只在确定「这是当前最优」时提交。
-            attempt_path = output_path.with_name(
-                f"{output_path.stem}.crf{crf}.part.mp4"
-            )
-            encoded = False
-            for audio_args in (("-c:a", "copy"), ("-c:a", "aac", "-b:a", "192k")):
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(video_path),
-                    "-vf",
-                    _COMPRESS_VF,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "medium",
-                    "-crf",
-                    str(crf),
-                    *audio_args,
-                    "-movflags",
-                    "+faststart",
-                    str(attempt_path),
-                ]
-                try:
-                    await exec_ffmpeg_cmd(cmd)
-                except Exception:
-                    # 音频流 copy 不兼容（少见编码装不进 MP4）或转码失败：
-                    # 清掉残缺输出，换下一组音频参数重试。必须先清输出 ——
-                    # 残缺文件顶着正式名会被 exists() 当成有效产物复用。
-                    await safe_unlink(attempt_path)
-                except BaseException:
-                    # CancelledError 等非 Exception 子类：清掉残缺输出后原样抛，
-                    # 取消语义不能被吞（与 merge_av / encode_video_to_h264 同形）。
-                    await safe_unlink(attempt_path)
-                    raise
-                else:
-                    encoded = True
-                    break
-            if not encoded:
-                # 该档位两组音频参数都失败：试下一档，档位用尽后按原文件发送
-                logger.warning(
-                    f"[denia_share] 视频压缩失败（ffmpeg 退出非 0，crf={crf}），"
-                    f"尝试下一档位或按原文件发送: {video_path.name}",
-                    exc_info=True,
-                )
-                continue
 
-            size = attempt_path.stat().st_size
-            if size <= limit_bytes:
-                os.replace(attempt_path, output_path)
-                logger.info(
-                    f"[denia_share] 视频压缩完成: {video_path.name} "
-                    f"{original_size / 1024 / 1024:.1f}MB -> "
-                    f"{size / 1024 / 1024:.1f}MB (crf={crf})"
+        async def run(
+            vf: str, video_args: list[str], tag: str, audio_variants: list[list[str]]
+        ) -> int | None:
+            """跑一档（按给定音频参数依次尝试），返回产物体积。"""
+            path = output_path.with_name(f"{output_path.stem}.{tag}.part.mp4")
+            for audio_args in audio_variants:
+                if await _compress_encode(
+                    video_path, path, vf=vf,
+                    video_args=video_args, audio_args=audio_args,
+                ):
+                    size = path.stat().st_size
+                    results.append((path, size, tag))
+                    return size
+            logger.warning(
+                f"[denia_share] 视频压缩失败（ffmpeg 退出非 0，{tag}）: {video_path.name}"
+            )
+            return None
+
+        # 音频默认原流复制（音质零损失）；个别编码装不进 MP4 时退回 AAC 192k。
+        copy_audio = [["-c:a", "copy"], ["-c:a", "aac", "-b:a", "192k"]]
+
+        if probe is not None:
+            duration, audio_bps = probe
+            total_bps = int(target_bytes * 8 / duration)
+            # 音频能原流复制就复制（音质零损失）—— 判据是「扣掉整条音轨后，
+            # 剩下的预算还够不够撑起一段能看的视频」。只有长视频把预算摊到
+            # 连音轨都装不下时，才按比例给音频封顶并降码率重编码。
+            if total_bps - audio_bps >= _MIN_VIDEO_BPS:
+                audio_target = audio_bps
+                audio_variants = copy_audio
+                audio_note = f"{audio_bps // 1000}k 原流复制"
+            else:
+                audio_target = min(
+                    audio_bps, max(int(total_bps * _AUDIO_BUDGET_RATIO), _MIN_AUDIO_BPS)
                 )
-                return output_path
-            if size < best_size:
-                best_size, best_path = size, attempt_path
+                audio_variants = [["-c:a", "aac", "-b:a", str(audio_target)]]
+                audio_note = (
+                    f"{audio_bps // 1000}k -> {audio_target // 1000}k 重编码（预算不足）"
+                )
+            video_bps = max(total_bps - audio_target, _MIN_VIDEO_BPS)
             logger.info(
-                f"[denia_share] crf={crf} 压缩后仍为 "
-                f"{size / 1024 / 1024:.1f}MB（阈值 {threshold_mb:g}MB），"
-                f"尝试更激进的压缩档位"
+                f"[denia_share] 压缩预算: 时长 {duration:.0f}s / 音频 {audio_note} "
+                f"/ 视频 {video_bps // 1000}k / 短边 {_target_short_side(video_bps)}"
             )
+            # 第一档：capped CRF —— 质量优先，但 maxrate 给体积封顶。
+            size = await run(
+                _scale_filter(_target_short_side(video_bps)),
+                ["-crf", "23", "-maxrate", str(video_bps),
+                 "-bufsize", str(video_bps * 2)],
+                "abr", audio_variants,
+            )
+            if size is not None and size > limit_bytes:
+                # 单遍 ABR 有过冲：按实测比例收紧预算再来一遍纯 ABR。
+                tightened = max(
+                    int(video_bps * target_bytes / size * 0.95), _MIN_VIDEO_BPS
+                )
+                logger.info(
+                    f"[denia_share] 首档 {size / 1048576:.1f}MB 仍超阈值，"
+                    f"收紧视频码率到 {tightened // 1000}k 重压"
+                )
+                await run(
+                    _scale_filter(_target_short_side(tightened)),
+                    ["-b:v", str(tightened), "-maxrate", str(tightened),
+                     "-bufsize", str(tightened * 2)],
+                    "abr2", audio_variants,
+                )
+        else:
+            # 探测不到时长就没有码率依据，退回 CRF 档位（不保证体积上限）。
+            logger.info(
+                f"[denia_share] 无法探测视频时长，退回 CRF 档位: {video_path.name}"
+            )
+            for crf in _COMPRESS_CRF_STEPS:
+                size = await run(
+                    _scale_filter(720), ["-crf", str(crf)], f"crf{crf}", copy_audio
+                )
+                if size is not None and size <= limit_bytes:
+                    break
 
-        # 所有档位都没压进阈值：提交体积更小的那份产物（通常仍是压缩产物），
-        # 并如实告知 —— 用户需要知道为什么发出来的还是大文件。
-        if best_path is not None:
-            os.replace(best_path, output_path)
+        # 选产物：优先达标的那一档（先跑的画质更好），都不达标就挑最小的，
+        # 但**必须比原文件小**才值得发 —— 否则压缩纯属帮倒忙。
+        chosen: tuple[Path, int, str] | None = None
+        for item in results:
+            if item[1] <= limit_bytes:
+                chosen = item
+                break
+        if chosen is None:
+            viable = [item for item in results if item[1] < original_size]
+            if viable:
+                chosen = min(viable, key=lambda item: item[1])
+
+        for path, _size, _tag in results:
+            if chosen is None or path != chosen[0]:
+                await safe_unlink(path)
+
+        if chosen is None:
+            logger.warning(
+                f"[denia_share] 视频压缩失败，按原文件发送: {video_path.name}"
+            )
+            return video_path
+
+        path, size, tag = chosen
+        os.replace(path, output_path)
+        if size <= limit_bytes:
+            logger.info(
+                f"[denia_share] 视频压缩完成: {video_path.name} "
+                f"{original_size / 1048576:.1f}MB -> {size / 1048576:.1f}MB ({tag})"
+            )
+        else:
             logger.warning(
                 f"[denia_share] 视频压缩后仍超过阈值 {threshold_mb:g}MB "
-                f"({original_size / 1024 / 1024:.1f}MB -> "
-                f"{best_size / 1024 / 1024:.1f}MB)，发送压缩产物"
+                f"({original_size / 1048576:.1f}MB -> {size / 1048576:.1f}MB)，"
+                f"发送压缩产物"
             )
-            return output_path
-        logger.warning(
-            f"[denia_share] 视频压缩失败，按原文件发送: {video_path.name}"
-        )
-        return video_path
+        return output_path
 
 
 def fmt_size(file_path: Path) -> str:
