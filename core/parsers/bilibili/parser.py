@@ -6,8 +6,12 @@
 
 import re
 import json
+import html
+import time
 import asyncio
-from typing import ClassVar
+import difflib
+from dataclasses import dataclass
+from typing import Any, ClassVar
 
 from astrbot.api import logger
 from bilibili_api import HEADERS, Credential, select_client, request_settings
@@ -37,6 +41,107 @@ try:
 except Exception:
     logger.warning("curl_cffi 未注册/未安装，B站解析器将使用默认 httpx 客户端")
     select_client("httpx")
+
+
+# ---------------------------------------------------------------- 标题反查
+#
+# QQ 官方机器人把 B站小程序卡片渲染成纯文本时，只留 title / preview /
+# source：没有 b23.tv，也没有 BV 号，唯一能落地的身份信息就是**视频标题**。
+# 所以「卡片没链接」这条路上，只能拿标题去 B站搜一次，再把搜到的视频当成
+# 用户分享的那条。
+#
+# 这里的取舍是「宁可不解析，也不发错视频」：只接受归一化之后**几乎完全一致**
+# 的那一条（默认 0.86），命中不了就当作没找到。翻唱 / 二创 / 同名投稿的标题
+# 往往只差几个字，阈值一放松就会把别人的视频发出去 —— 那比零反应更糟。
+TITLE_MATCH_MIN_RATIO = 0.86
+
+# 自动解析之上还有一档：给出候选、由用户点选（不自动发卡片）。
+# 落在 [TITLE_CANDIDATE_MIN_RATIO, TITLE_MATCH_MIN_RATIO) 之间说明「像但不保准」，
+# 静默丢弃等于让用户面对零反应，直接发又可能发错 —— 折中是列出来让用户挑。
+TITLE_CANDIDATE_MIN_RATIO = 0.62
+
+# 单次卡片反查最多允许的搜索请求数（每页算一次）。标题精确命中时 1 次就够，
+# 只有标题带噪声时才需要多试一个关键词 + 第二页。
+TITLE_SEARCH_MAX_REQUESTS = 3
+
+# 命中到这个程度才提前收工，不去翻第二页：0.97 以上基本就是同一条视频，
+# 留一点余量给「标题被改过几个字」的情况。
+TITLE_EARLY_STOP_RATIO = 0.97
+
+# 同一标题的搜索结果缓存时长（秒）。同一张卡片常被反复转发。
+TITLE_SEARCH_CACHE_TTL = 1800
+TITLE_SEARCH_CACHE_MAX = 200
+
+# 搜索结果标题带 ``<em class="keyword">`` 高亮；归一化时要连标签一起剥掉，
+# 否则同一条视频会因为它多出 30 个字符而算成「不相似」。
+_TITLE_TAG_RE = re.compile(r"<[^>]+>")
+
+# 归一化时抹掉的字符：空白、全角空格，以及标题两边常见的分隔符 / 标点。
+# 保留汉字、字母、数字 —— 这些才承载「是哪条视频」。
+_TITLE_NOISE_RE = re.compile(
+    r"[\s\u3000|｜:：,，.。!！?？~～\-—_/\\()（）\[\]【】「」『』《》\"'“”‘’·]+"
+)
+
+
+def normalize_title(text: str) -> str:
+    """标题归一化：剥高亮标签、还原实体、去掉空白与标点、统一大小写。"""
+    cleaned = html.unescape(_TITLE_TAG_RE.sub("", str(text or "")))
+    return _TITLE_NOISE_RE.sub("", cleaned).lower()
+
+
+def title_similarity(left: str, right: str) -> float:
+    """两个标题的相似度（0~1），已按 :func:`normalize_title` 归一化。"""
+    a, b = normalize_title(left), normalize_title(right)
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+# 官方系列投稿的标题普遍是「主标题 | 副标题」（``《鸣潮》共鸣者战斗演示 | 莉莉``）。
+# 同系列不同角色只差最后这一段，整串比对天然会给出 0.8~0.86 的假高分，
+# 所以打分时把副标题单独拎出来加权。注意归一化会把这些分隔符全删掉，
+# 这里必须对**原始标题**切分。
+_TITLE_SUBTITLE_RE = re.compile(r"[|｜/\\:：\-—–_·、]+")
+
+
+# 标题尾部 / 中部的平台噪声。QQ 卡片、各站分享口令经常给标题加料：
+# ``《X》 | 莉莉 - 哔哩哔哩``、``【鸣潮】… #鸣潮# #游戏#``。这些词不承载
+# 「是哪条视频」的信息，留着会把相似度拉低到阈值以下。
+_PLATFORM_SUFFIX_RE = re.compile(
+    r"\s*[-—–|｜]\s*(?:哔哩哔哩|bilibili|b站|抖音|快手|微博|小红书|acfun|youtube)\s*$",
+    re.IGNORECASE,
+)
+_HASHTAG_RE = re.compile(r"[#＃][^#＃\s]{0,40}[#＃]?")
+
+
+def clean_title(text: str) -> str:
+    """去掉标题上的平台噪声（HTML 高亮、话题标签、``- 哔哩哔哩`` 后缀）。"""
+    cleaned = html.unescape(_TITLE_TAG_RE.sub("", str(text or ""))).strip()
+    cleaned = _HASHTAG_RE.sub(" ", cleaned)
+    # 每轮剥掉一段平台后缀、文本严格变短，剥不动即为收敛点。终止条件写在
+    # 循环头（而不是 while True + break），有界性一眼可见，也避免静态检查
+    # 把它当成「无让出点的死循环」。
+    while (stripped := _PLATFORM_SUFFIX_RE.sub("", cleaned).strip()) != cleaned:
+        cleaned = stripped
+    return re.sub(r"\s+", " ", cleaned).strip(" -—–|｜")
+
+
+@dataclass(frozen=True)
+class VideoCandidate:
+    """一条候选视频。``score`` 是 0~1 的标题匹配分。"""
+
+    bvid: str
+    title: str
+    author: str
+    score: float
+
+    @property
+    def url(self) -> str:
+        return f"https://www.bilibili.com/video/{self.bvid}"
+
+    def display(self) -> str:
+        author = f"（{self.author}）" if self.author else ""
+        return f"{self.title}{author}"
 
 
 class BilibiliParser(BaseParser):
@@ -107,12 +212,197 @@ class BilibiliParser(BaseParser):
                 )
                 await asyncio.sleep(delay)
 
+    # ---------------- 分享卡片：按标题反查视频 ----------------
+
+    @classmethod
+    def _title_parts(cls, text: str) -> list[str]:
+        """按主 / 副标题切开，去掉空白段。
+
+        先剥 HTML 标签再切：搜索结果的副标题也会被高亮包裹
+        （``| <em class="keyword">莉莉</em>``），直接切会在 ``</em>`` 上劈开，
+        把副标题切丢、尾部剩一个 ``em>`` 残片。
+        """
+        cleaned = html.unescape(_TITLE_TAG_RE.sub("", str(text or "")))
+        return [part.strip() for part in _TITLE_SUBTITLE_RE.split(cleaned) if part.strip()]
+
+    @classmethod
+    def title_tail(cls, text: str) -> str:
+        """标题最后一段（通常是角色名 / 集数），已归一化。"""
+        for part in reversed(cls._title_parts(text)):
+            cleaned = normalize_title(part)
+            if cleaned:
+                return cleaned
+        return ""
+
+    @classmethod
+    def build_title_queries(cls, title: str) -> list[str]:
+        """同一张卡片可以试的搜索词，越靠前越精确，最多两个。
+
+        卡片标题经常被平台加工过（尾部缀 ``- 哔哩哔哩``、带一堆 ``#话题#``），
+        原样搜会连一条都对不上；这时退一步只用主标题再搜一次。多花一次请求，
+        换取「标题被加工过」这一类漏识别。
+        """
+        raw = clean_title(str(title or "").strip())
+        queries: list[str] = [raw] if raw else []
+        parts = cls._title_parts(raw)
+        if len(parts) >= 2:
+            cut = raw.rfind(parts[-1])
+            head = raw[:cut].strip(" \t|｜-—–_·、") if cut > 0 else ""
+            if head and head not in queries:
+                queries.append(head)
+        return queries[:2]
+
+    @classmethod
+    def score_video(cls, title: str, candidate: str) -> float:
+        """标题匹配打分（0~1），越高越可能是同一条视频。
+
+        两段式：整串相似度占 0.75，副标题（``|`` 之后那段）相似度占 0.25。
+        带分隔符的标题才启用副标题权重 —— 单段标题没有「副标题」可言，
+        硬切会把普通视频标题的最后几个字当成副标题，反而降低准确度。
+        """
+        title = clean_title(title)
+        candidate = clean_title(candidate)
+        full = title_similarity(title, candidate)
+        if len(cls._title_parts(title)) < 2:
+            return full
+        q_tail, c_tail = cls.title_tail(title), cls.title_tail(candidate)
+        if not q_tail or not c_tail:
+            return full
+        tail = difflib.SequenceMatcher(None, q_tail, c_tail).ratio()
+        return 0.75 * full + 0.25 * tail
+
+    @classmethod
+    def rank_videos(cls, items: Any, title: str) -> list[VideoCandidate]:
+        """把搜索结果整理成按匹配分排序的候选列表（纯函数，可离线测）。"""
+        candidates: list[VideoCandidate] = []
+        seen: set[str] = set()
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            bvid = str(item.get("bvid") or "").strip()
+            if not bvid or bvid in seen:
+                continue
+            seen.add(bvid)
+            raw_title = str(item.get("title") or "")
+            candidates.append(
+                VideoCandidate(
+                    bvid=bvid,
+                    title=html.unescape(_TITLE_TAG_RE.sub("", raw_title)).strip(),
+                    author=str(item.get("author") or "").strip(),
+                    score=cls.score_video(title, raw_title),
+                )
+            )
+        candidates.sort(key=lambda item: item.score, reverse=True)
+        return candidates
+
+    @classmethod
+    def pick_best_video(cls, results: Any, title: str) -> str | None:
+        """从搜索结果里挑出与标题最接近的一条，返回 ``bvid``；认不出返回 ``None``。"""
+        ranked = cls.rank_videos(results, title)
+        if ranked and ranked[0].score >= TITLE_MATCH_MIN_RATIO:
+            return ranked[0].bvid
+        return None
+
+    # ---------------------------------------------------------- 缓存
+
+    def _title_cache_get(self, keyword: str) -> list[VideoCandidate] | None:
+        entry = self._title_cache.get(keyword)
+        if not entry:
+            return None
+        stamp, value = entry
+        if time.monotonic() - stamp > TITLE_SEARCH_CACHE_TTL:
+            self._title_cache.pop(keyword, None)
+            return None
+        return value
+
+    def _title_cache_put(self, keyword: str, value: list[VideoCandidate]) -> None:
+        if len(self._title_cache) >= TITLE_SEARCH_CACHE_MAX:
+            # 简单淘汰：清掉最早写入的那批，够用且不引入额外数据结构。
+            for key in list(self._title_cache)[: TITLE_SEARCH_CACHE_MAX // 4]:
+                self._title_cache.pop(key, None)
+        self._title_cache[keyword] = (time.monotonic(), value)
+
+    # ---------------------------------------------------- 对外入口
+
+    async def search_video_candidates(self, title: str, *, limit: int = 3) -> list[VideoCandidate]:
+        """按标题反查候选视频，按匹配分从高到低返回（可能为空）。
+
+        策略：先用完整标题搜第一页；命中不到「几乎确定」的程度就再翻第二页、
+        换主标题再搜一次，最多 ``TITLE_SEARCH_MAX_REQUESTS`` 次请求。
+        结果按标题缓存 30 分钟，同一张卡片被反复转发时不重复打接口。
+
+        失败一律降级成空列表：搜索只是「附加能力」，不该让整条消息变报错。
+        """
+        keyword = str(title or "").strip()
+        # 太短的标题（「预告」「第一集」）搜出来全是噪声，直接放弃。
+        if len(normalize_title(keyword)) < 4:
+            return []
+
+        cached = self._title_cache_get(keyword)
+        if cached is not None:
+            return cached[:limit]
+
+        from bilibili_api import search
+
+        collected: list[Any] = []
+        requests = 0
+        ranked: list[VideoCandidate] = []
+        for query in self.build_title_queries(keyword):
+            pages = (1, 2) if query == keyword else (1,)
+            for page in pages:
+                if requests >= TITLE_SEARCH_MAX_REQUESTS:
+                    break
+                requests += 1
+                try:
+                    payload = await self._call_bili_api_with_retry(
+                        lambda q=query, p=page: search.search_by_type(
+                            q,
+                            search_type=search.SearchObjectType.VIDEO,
+                            page=p,
+                            page_size=30,
+                        ),
+                        operation="标题搜索",
+                    )
+                except Exception as error:  # noqa: BLE001 - 搜索失败一律降级
+                    logger.warning(f"B站按标题反查失败（{query} 第{page}页）：{error}")
+                    break
+                items = payload.get("result") if isinstance(payload, dict) else None
+                collected.extend(items or [])
+                ranked = self.rank_videos(collected, keyword)
+                if ranked and ranked[0].score >= TITLE_EARLY_STOP_RATIO:
+                    # 已经基本确定是同一条，不再浪费请求。
+                    self._title_cache_put(keyword, ranked[:limit])
+                    return ranked[:limit]
+            if ranked and ranked[0].score >= TITLE_EARLY_STOP_RATIO:
+                break
+
+        ranked = [
+            item for item in self.rank_videos(collected, keyword)
+            if item.score >= TITLE_CANDIDATE_MIN_RATIO
+        ][:limit]
+        self._title_cache_put(keyword, ranked)
+        return ranked
+
+    async def search_video_url(self, title: str) -> str | None:
+        """按标题反查唯一的视频链接；认不出就返回 ``None``。
+
+        只返回「够确定」的那条（``TITLE_MATCH_MIN_RATIO`` 以上），
+        供只需要一个结果的调用方使用；需要给用户挑候选的场合用
+        :meth:`search_video_candidates`。
+        """
+        candidates = await self.search_video_candidates(title, limit=1)
+        if candidates and candidates[0].score >= TITLE_MATCH_MIN_RATIO:
+            return candidates[0].url
+        return None
+
     def __init__(self, downloader, bili_ck: str | None = None, config_dir=None):
         super().__init__(downloader)
         self.headers = HEADERS.copy()
         self._credential: Credential | None = None
         self._bili_ck = bili_ck
         self._cookies_file = (config_dir / "bilibili_cookies.json") if config_dir else None
+        # 标题 → 候选列表。同一张卡片常被同一群里多个人转发，缓存能省掉重复搜索。
+        self._title_cache: dict[str, tuple[float, list[VideoCandidate]]] = {}
 
     @handle("b23.tv", r"b23\.tv/[0-9a-zA-Z._?%&+-=/#]+")
     @handle("bili2233", r"bili2233\.cn/[0-9a-zA-Z._?%&+-=/#]+")

@@ -223,6 +223,14 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "default": False,
         "hint": "关闭则只写日志、不在群里刷报错。排查问题时可临时打开",
     },
+    {
+        "key": "CARD_TITLE_SEARCH",
+        "group": "解析设置",
+        "label": "分享卡片按标题反查",
+        "type": "bool",
+        "default": True,
+        "hint": "QQ 官方机器人下发的小程序卡片只有标题、没有链接。开启后按标题去 B站搜一次，只认几乎完全一致的标题；关掉则这类卡片静默忽略",
+    },
     # ---------------- 权限控制 ---------------- #
     # 名单是**逗号分隔的字符串**，不是列表：本插件的配置是扁平键值，
     # _conf_schema.json 只支持 bool / int / select / string / text，
@@ -1947,6 +1955,15 @@ class ParserConfig:
     def SEND_ERROR_MESSAGES(self) -> bool:
         """解析失败时是否向对话发送错误提示（关闭则只记日志，群里更安静）。"""
         return bool(self._cfg_get("SEND_ERROR_MESSAGES", False))
+
+    @property
+    def CARD_TITLE_SEARCH(self) -> bool:
+        """分享卡片没有链接时，是否按标题去平台反查。
+
+        QQ 官方机器人下发的小程序卡片只保留标题（没有 b23.tv、没有 BV 号），
+        这是唯一能让它落地的路；关掉则这类卡片仍然静默忽略。
+        """
+        return bool(self._cfg_get("CARD_TITLE_SEARCH", True))
 
     @property
     def TWITTER_MEDIA_PROXY_BASE(self) -> str:

@@ -46,6 +46,13 @@
         "default": false,
         "invisible": true,
         "hint": "关闭则只写日志、不在群里刷报错。排查问题时可临时打开"
+      },
+      "CARD_TITLE_SEARCH": {
+        "description": "分享卡片按标题反查",
+        "type": "bool",
+        "default": true,
+        "invisible": true,
+        "hint": "QQ 官方机器人下发的小程序卡片只有标题、没有链接。开启后按标题去 B站搜一次，只认几乎完全一致的标题；关掉则这类卡片静默忽略"
       }
     }
   },

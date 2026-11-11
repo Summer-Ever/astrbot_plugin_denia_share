@@ -59,6 +59,8 @@ from .core.exception import (
     ParseException, IgnoreException, SilentException,
 )
 from .core.card_renderer import ShareCardRenderer
+from .core.card_links import card_summary, extract_links, has_card
+from .core.card_text import card_of as card_text_of
 from .core.screenshot import (
     ScreenshotService,
     describe_capture,
@@ -70,6 +72,9 @@ from .core.parsers import (
     XiaoHongShuParser, TwitterParser, NGAParser, AcfunParser,
     GitHubParser, PixivParser, SteamParser, XiaoheiheParser,
 )
+# 「按标题反查」的自动解析阈值：卡片候选分档判断要用同一个数字，
+# 两边各写一遍迟早会漂移。
+from .core.parsers.bilibili.parser import TITLE_MATCH_MIN_RATIO
 from .core.custom_parsers import (
     SUBDIR_NAME as CUSTOM_PARSERS_SUBDIR,
     CustomParserLoader,
@@ -98,6 +103,11 @@ LOGIN_STATE_MAX = 32
 # 手动清空缓存」三处 clear，而清理循环在 CACHE_TTL_HOURS=0 时根本不启动 ——
 # 也就是说那种部署下它永不回收。加个条数上限兜底，与 TTL 无关。
 MAX_RESULT_CACHE_ENTRIES = 128
+
+# QQ 官方机器人的分享卡片只下发渲染后的文本，链接被腾讯裁掉了（详见
+# core/card_text.py）。按标题反查是唯一的补救手段，一旦认不出，就把话说清楚，
+# 别让用户对着一张毫无反应的卡片发呆。
+CARD_LOOKUP_FAILED_HINT = "由于QQ限制查找失败，可粘贴直链发送"
 
 # 渲染索引（cache_key -> 卡片路径）的条数上限。
 #
@@ -327,6 +337,7 @@ class DeniaSharePlugin(Star):
         self._proxy_downloader: StreamDownloader | None = None
         self.disabled_platforms = pconfig.DISABLED_PLATFORMS
         self._send_errors = pconfig.SEND_ERROR_MESSAGES
+        self._card_title_search = pconfig.CARD_TITLE_SEARCH
 
         self.parsers: dict[str, Any] = {}
         # 用户自定义解析器的加载器。延迟到 _init_parsers 里建（那时 downloader 已就绪）
@@ -638,7 +649,7 @@ class DeniaSharePlugin(Star):
         return not allowed
 
     async def _dispatch(self, event: AstrMessageEvent, name: str):
-        if self._has_json_component(event):
+        if self._card_takes_over(event):
             return
         parser = self.parsers.get(name)
         if not parser:
@@ -747,9 +758,19 @@ class DeniaSharePlugin(Star):
     @filter.regex(URL_PATTERN)
     async def custom_parser_handler(self, event: AstrMessageEvent, matched: re.Match | None = None):
         """自定义解析器的聊天入口（通用 URL 匹配）"""
-        if self._has_json_component(event):
+        if self._card_takes_over(event):
             return
+        # 官方机器人的文本卡片里，封面图与 app 图标也是 http 链接；放给自定义
+        # 解析器会把一张 100×100 的图标当成正文解析（尤其「匹配任意 URL」的配置）。
+        card = card_text_of(event)
+        card_images = card.image_links if card is not None else []
         for link in dict.fromkeys(URL_PATTERN.findall(event.message_str or "")):
+            # 用前缀比较：``URL_PATTERN`` 会把链接后面的中文一起吞掉，
+            # 直接判等匹配不上。
+            if any(
+                link.startswith(image) or image.startswith(link) for image in card_images
+            ):
+                continue
             if self._match_builtin_parser(link) is not None:
                 continue
             parser = self._match_custom_parser(link)
@@ -774,7 +795,11 @@ class DeniaSharePlugin(Star):
     @filter.regex(URL_PATTERN)
     async def screenshot_fallback_handler(self, event: AstrMessageEvent, matched: re.Match | None = None):
         """无可解析平台时按需截图兜底（默认关闭）。"""
-        if not self._screenshot_fallback or self._has_json_component(event):
+        if not self._screenshot_fallback or self._card_takes_over(event):
+            return
+        if card_text_of(event) is not None:
+            # 官方机器人把卡片渲染成纯文本，里面唯一的链接是 app 图标和封面图；
+            # 截图兜底在这里只会把一张 100×100 的图标当网页截出来。
             return
         url = self._first_url(event)
         if not url or self._match_parser(url) is not None:
@@ -846,18 +871,22 @@ class DeniaSharePlugin(Star):
         """点歌 歌名显示本插件搜歌卡片，听1 按编号发送音频。"""
         from .core.music.controller import music_command
         selected = music_command(event.message_str)
-        if selected is None or self._has_json_component(event):
+        if selected is None or self._card_takes_over(event):
             return
         async for output in self._get_music_controller().handle(event, *selected):
             yield output
 
     @filter.regex(r".*")
     async def json_card_handler(self, event: AstrMessageEvent, matched: re.Match | None = None):
-        """QQ 小程序分享卡片（Json 消息段）里的链接解析"""
-        if not self._has_json_component(event):
+        """QQ 分享卡片（Json / Xml / Ark）里的链接解析"""
+        if not has_card(event):
             return
         links = self._prioritize_card_links(self._extract_links_from_event(event))
         if not links:
+            # 卡片收到了、但里面没有任何 http 链接（小程序卡片只带 appid + path
+            # 时就是这样）。原来这里直接 return，用户看到的是「零反应」，也没法
+            # 判断是没识别到卡片还是解析失败 —— 打一条日志，配合 /denia_card 定位。
+            logger.info("[denia_share] 收到分享卡片但没有可用链接：\n%s", card_summary(event))
             return
         for link in links:
             for parser in self.parsers.values():
@@ -899,6 +928,62 @@ class DeniaSharePlugin(Star):
             return 2
 
         return sorted(unique, key=priority)
+
+    @filter.regex(r"\[卡片消息\]")
+    async def share_card_text_handler(self, event: AstrMessageEvent, matched: re.Match | None = None):
+        """QQ 小程序 / 图文卡片（官方机器人文本形态）解析"""
+        # QQ 官方机器人不下发 json / xml 消息段，而是把卡片渲染成一段纯文本
+        # （``[卡片消息] 小程序\n摘要: ...\ntitle: ...\nsource: 哔哩哔哩``）。
+        # 这条路上一个 http 链接都没有，所以走「按标题反查」。
+        if self._card_takes_over(event):
+            # 结构化卡片段（json / xml / ark）已由 json_card_handler 接手
+            return
+        card = card_text_of(event)
+        if card is None:
+            return
+        if card.links:
+            # 卡片正文里自带跳转链接（腾讯频道图文卡片就是这样），交给各平台
+            # 自己的处理器；这里再解析一遍等于同一张卡片回两遍。
+            return
+        if self._claimable_link(event):
+            # 卡片里没有规范的导航字段，但正文（摘要 / 标题）里藏了链接，
+            # 而某个平台处理器会认领它 —— 同样让路，避免重复回复。
+            return
+        if not self._card_title_search:
+            return
+        parser = self.parsers.get(card.platform) if card.platform else None
+        finder = getattr(parser, "search_video_candidates", None)
+        if parser is None or not callable(finder):
+            logger.info(
+                "[denia_share] 卡片里没有链接，来源也不支持按标题反查：\n%s",
+                "\n".join(card.detail_lines()),
+            )
+            yield event.plain_result(CARD_LOOKUP_FAILED_HINT)
+            return
+        candidates = await finder(card.title)
+        if candidates:
+            best = candidates[0]
+            if best.score >= TITLE_MATCH_MIN_RATIO:
+                logger.info(
+                    f"[denia_share] 卡片没有链接，按标题反查到 {best.url}"
+                    f"（匹配度 {best.score:.2f}）：{card.title}"
+                )
+                async for r in self._process_url(_EventUrlWrapper(event, best.url), parser):
+                    yield r
+                return
+            # 「像但不确定」：同系列投稿常常只差一个角色名，自动发就是发错视频。
+            # 候选也不列了 —— 直接告诉用户贴直链，比让他从一堆近似标题里猜更省事。
+            logger.info(
+                f"[denia_share] 卡片没有链接，标题只有模糊匹配（最高 {best.score:.2f}）："
+                f"{card.title}"
+            )
+        else:
+            logger.info(
+                "[denia_share] 卡片没有链接，按标题没搜到足够接近的视频（%s）：\n%s",
+                card.title or "（无标题）",
+                "\n".join(card.detail_lines()),
+            )
+        yield event.plain_result(CARD_LOOKUP_FAILED_HINT)
 
     # ==================== 核心流程 ====================
 
@@ -1549,6 +1634,7 @@ class DeniaSharePlugin(Star):
 
         self.disabled_platforms = pconfig.DISABLED_PLATFORMS
         self._send_errors = pconfig.SEND_ERROR_MESSAGES
+        self._card_title_search = pconfig.CARD_TITLE_SEARCH
 
         # 共享缓存目录可能被改了：换目录后旧的内存缓存全部失效
         new_cache_dir, source = self._resolve_cache_dir(
@@ -2783,66 +2869,46 @@ class DeniaSharePlugin(Star):
         except Exception as e:
             logger.error(f"发送消息到 {session} 失败: {e}")
 
-    # ==================== JSON 卡片工具 ====================
+    # ==================== 分享卡片工具 ====================
+
+    def _card_takes_over(self, event: AstrMessageEvent) -> bool:
+        """这张卡片是否该由 ``json_card_handler`` 独占处理。
+
+        判定从「有没有 Json 组件」放宽成「有没有卡片段 **并且** 卡片里抽得到链接」：
+
+        - 为什么放宽到卡片段：AstrBot 只把 OneBot 的 ``json`` 段转成组件，
+          ``xml`` / ``ark`` / ``light_app`` 不在 ``ComponentTypes`` 里，会被适配器
+          整段丢弃。协议端把 B站卡片发成 xml 时，插件拿到的是一条空消息 ——
+          只看组件就永远认不出来。
+        - 为什么还要求「抽得到链接」：卡片里没有链接时，让内置平台处理器继续
+          处理同一条消息里的文本链接。以前「一句话 + 一张无链接卡片」两条路
+          互让，谁都解析不出来。
+        """
+        if not has_card(event):
+            return False
+        return bool(self._extract_links_from_event(event))
 
     @staticmethod
-    def _has_json_component(event: AstrMessageEvent) -> bool:
-        if not hasattr(event, "message_obj") or not hasattr(event.message_obj, "message"):
-            return False
-        for c in event.message_obj.message:
-            if isinstance(c, Comp.Json):
-                return True
-            t = c.get("type") if isinstance(c, dict) else getattr(c, "type", None)
-            if t and t != "reply" and "json" in str(t).lower():
+    def _extract_links_from_event(event: AstrMessageEvent) -> list[str]:
+        """消息里的候选链接，卡片段（含 xml / ark）优先，详见 core/card_links.py。"""
+        return extract_links(event)
+
+    def _claimable_link(self, event: AstrMessageEvent) -> bool:
+        """消息里的链接是否有内置解析器认领。
+
+        只用于「同一张卡片别回两遍」这一个判断：正文里藏了 b23.tv 时，
+        ``bilibili_handler`` 会自己跑一遍，卡片处理器必须让路。
+        """
+        for link in self._extract_links_from_event(event):
+            for parser in self.parsers.values():
+                try:
+                    parser.search_url(link)
+                except (SilentException, ParseException):
+                    continue
+                except Exception:
+                    continue
                 return True
         return False
-
-    def _extract_links_from_event(self, event: AstrMessageEvent) -> list[str]:
-        links: list[str] = []
-        if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
-            for c in event.message_obj.message:
-                if isinstance(c, Comp.Json):
-                    links.extend(self._extract_links_from_json(c.data))
-                elif isinstance(c, Comp.Plain):
-                    links.extend(URL_PATTERN.findall(c.text or ""))
-                elif isinstance(c, dict) and "json" in str(c.get("type", "")).lower():
-                    links.extend(self._extract_links_from_json(c.get("data", c)))
-        links.extend(URL_PATTERN.findall(event.message_str or ""))
-        return links
-
-    @staticmethod
-    def _extract_links_from_json(data) -> list[str]:
-        links: list[str] = []
-        try:
-            if isinstance(data, str):
-                data = json.loads(data)
-
-            def search(obj):
-                found = []
-                if isinstance(obj, dict):
-                    meta = obj.get("meta") or {}
-                    if isinstance(meta, dict):
-                        for dk in ("detail_1", "detail", "news", "music"):
-                            d = meta.get(dk) or {}
-                            if isinstance(d, dict):
-                                for uk in ("qqdocurl", "url", "jumpUrl"):
-                                    v = d.get(uk)
-                                    if isinstance(v, str) and v:
-                                        found.append(v)
-                    for v in obj.values():
-                        if isinstance(v, str) and v.startswith(("http://", "https://")):
-                            found.append(v)
-                        elif isinstance(v, (dict, list)):
-                            found.extend(search(v))
-                elif isinstance(obj, list):
-                    for item in obj:
-                        found.extend(search(item))
-                return found
-
-            links.extend(search(data))
-        except Exception as e:
-            logger.warning(f"解析 JSON 消息组件失败: {e}")
-        return links
 
     # ==================== 管理命令 ====================
 
@@ -2864,6 +2930,31 @@ class DeniaSharePlugin(Star):
             f"{'，链接兜底开' if self._screenshot_fallback else ''}\n"
             f"错误提示：{'开' if self._send_errors else '关'}"
         )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("denia_card")
+    async def denia_card_debug(self, event: AstrMessageEvent):
+        """查看分享卡片的原始结构（直接发、或引用卡片后发）"""
+        from types import SimpleNamespace
+
+        target: Any = event
+        for comp in event.get_messages():
+            chain = getattr(comp, "chain", None)
+            if isinstance(comp, Comp.Reply) and chain:
+                # 引用一条卡片消息时，卡片在 reply 的 chain 里，不在本条消息里
+                target = SimpleNamespace(
+                    message_obj=SimpleNamespace(raw_message=None, message=list(chain)),
+                    message_str=getattr(comp, "message_str", "") or "",
+                )
+                break
+        lines = [card_summary(target)]
+        # QQ 官方机器人把卡片渲染成纯文本，不走消息段 —— 那部分单列一块，
+        # 否则「原始段: （无）」会让人误以为插件什么也没收到。
+        text_card = card_text_of(target)
+        if text_card is not None:
+            lines.append("— 文本卡片（官方机器人）—")
+            lines.extend(text_card.detail_lines())
+        yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("denia_clear")
