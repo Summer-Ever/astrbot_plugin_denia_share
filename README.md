@@ -91,6 +91,7 @@
 | `DISABLED_PLATFORMS` | 空 | 禁用不需要的平台，也可直接在总览页切换 |
 | 输出模式 | 卡片 + 富媒体 | 文本、卡片、富媒体可任意组合；全部关闭时停止聊天链接解析 |
 | `VIDEO_DURATION_MAXIMUM` / `VIDEO_SIZE_MAXIMUM_MB` | 480 秒 / 100 MB | 视频与音频下载上限；超限原因显示在已选文本或卡片中 |
+| `DOUYIN_COMPRESS_SIZE_MB` | 30 MB | 抖音视频超过该体积时压到 720p 再发送（音频不重编码）；0 关闭 |
 | `SEND_ERROR_MESSAGES` | 关闭 | 解析失败时是否在聊天里提示 |
 | `BILI_QUALITY` / `BILI_CODEC` | 1080P / H.264 优先 | B站下载画质与编码偏好，实际画质取决于账号和视频权限 |
 | `PROXY` | 空 | 代理地址，配合各平台与网页截图的代理开关使用 |

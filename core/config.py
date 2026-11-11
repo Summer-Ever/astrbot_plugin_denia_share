@@ -205,6 +205,17 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "hint": "下载前按 Content-Length 判断，边下边判。QQ 大文件上传容易失败，建议不超过 60",
     },
     {
+        "key": "DOUYIN_COMPRESS_SIZE_MB",
+        "group": "解析设置",
+        "label": "抖音视频压缩阈值",
+        "type": "int",
+        "default": 30,
+        "min": 0,
+        "max": 4096,
+        "unit": "MB",
+        "hint": "抖音视频超过该体积时，发送前用 ffmpeg 压到 720p（音频不重编码，尽量保留音质），避免文件过大发送失败。0 = 关闭压缩。需要本机安装 ffmpeg",
+    },
+    {
         "key": "SEND_ERROR_MESSAGES",
         "group": "解析设置",
         "label": "解析失败时发送错误提示",
@@ -1389,6 +1400,15 @@ class ParserConfig:
     def VIDEO_SIZE_MAXIMUM_MB(self) -> int:
         """单个视频体积上限（MB），超限不下载。"""
         return max(1, int(self._cfg_get("VIDEO_SIZE_MAXIMUM_MB", 100)))
+
+    @property
+    def DOUYIN_COMPRESS_SIZE_MB(self) -> int:
+        """抖音视频压缩阈值（MB）：下载完成后体积超过它就压到 720p 再发送。
+
+        0 表示关闭压缩。阈值是**每次下载后实时读取**的，改完配置立即生效，
+        不需要重启也不需要热更新钩子。
+        """
+        return max(0, int(self._cfg_get("DOUYIN_COMPRESS_SIZE_MB", 30)))
 
     @property
     def PROXY(self) -> str:

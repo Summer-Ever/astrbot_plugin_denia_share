@@ -15,6 +15,7 @@
 """
 
 import re
+from pathlib import Path
 from typing import Any, ClassVar
 
 import aiohttp
@@ -23,6 +24,7 @@ from astrbot.api import logger
 
 from ...base_parser import BaseParser, PlatformEnum, ParseException, handle
 from ...data import Platform, platform_of
+from ...task import PathTask
 from .models.video import unwrap_audio_url
 from ...media_utils import fmt_duration
 
@@ -33,6 +35,51 @@ class DouyinParser(BaseParser):
     def __init__(self, downloader):
         super().__init__(downloader)
         self._web_client = None
+
+    # ------------------------------------------------------------------ #
+    # 大视频压缩（DOUYIN_COMPRESS_SIZE_MB）
+    # ------------------------------------------------------------------ #
+
+    def create_video(self, url_or_task, cover_url=None, duration=None, is_gif=False):
+        """重写基类：抖音视频在下载完成后按阈值压缩到 720p。
+
+        抖音大视频直发 QQ 常因文件过大被协议端拒绝，压缩能显著提高送达率；
+        阈值由配置 ``DOUYIN_COMPRESS_SIZE_MB`` 控制（0 = 关闭）。
+
+        只有「URL 直传」的路径需要包压缩工厂 —— 传 Task / PathTask 的调用方
+        已经自己管下载，不该被二次包装。压缩阈值在惰性工厂**内部**读取：
+        仅文本/仅卡片模式下不会有人 get 这个任务，构造时连配置都不用碰，
+        改完配置也无需任何热更新钩子即可生效。
+        """
+        if isinstance(url_or_task, str):
+            return super().create_video(
+                PathTask.lazy(lambda url=url_or_task: self._download_and_compress(url)),
+                cover_url=cover_url,
+                duration=duration,
+                is_gif=is_gif,
+            )
+        return super().create_video(
+            url_or_task, cover_url=cover_url, duration=duration, is_gif=is_gif
+        )
+
+    async def _download_and_compress(self, url: str) -> Path:
+        """下载抖音视频，然后按当前配置决定是否压缩。
+
+        配置读取包在 try 里：解析器其余部分不依赖任何配置项，这里同样不能让
+        「配置不可用」把整条视频下载炸掉 —— 读不到就当关闭压缩。
+        """
+        path = await self.downloader.download_video(url, ext_headers=self.headers)
+        try:
+            from ...config import get_config
+            from ...media_utils import compress_video_if_needed
+
+            threshold = get_config().DOUYIN_COMPRESS_SIZE_MB
+        except Exception:
+            logger.debug("[douyin] 读取压缩阈值失败，跳过压缩", exc_info=True)
+            return path
+        if threshold <= 0:
+            return path
+        return await compress_video_if_needed(path, threshold)
 
     # ------------------------------------------------------------------ #
     # URL 注册

@@ -30,6 +30,16 @@
         "max": 4096,
         "unit": "MB"
       },
+      "DOUYIN_COMPRESS_SIZE_MB": {
+        "description": "抖音视频压缩阈值",
+        "type": "int",
+        "default": 30,
+        "invisible": true,
+        "hint": "抖音视频超过该体积时，发送前用 ffmpeg 压到 720p（音频不重编码，尽量保留音质），避免文件过大发送失败。0 = 关闭压缩。需要本机安装 ffmpeg",
+        "min": 0,
+        "max": 4096,
+        "unit": "MB"
+      },
       "SEND_ERROR_MESSAGES": {
         "description": "解析失败时发送错误提示",
         "type": "bool",
