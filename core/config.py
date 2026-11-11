@@ -213,7 +213,21 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "min": 0,
         "max": 4096,
         "unit": "MB",
-        "hint": "抖音视频超过该体积时，发送前用 ffmpeg 压到 720p（音频不重编码，尽量保留音质），避免文件过大发送失败。0 = 关闭压缩。需要本机安装 ffmpeg",
+        "hint": "抖音视频超过该体积时，发送前用 ffmpeg 压缩，避免文件过大发送失败。画质优先：先试着守住 720p 定质量压（静态/图文内容这样压又小又清晰），确实压不进阈值才按码率预算降档。限帧 30fps，音频不重编码。0 = 关闭压缩。需要本机安装 ffmpeg",
+    },
+    {
+        "key": "DOUYIN_COMPRESS_CODEC",
+        "group": "解析设置",
+        "label": "抖音视频压缩编码",
+        "type": "select",
+        "default": "H.264 兼容优先",
+        "options": ["H.264 兼容优先", "H.265 画质优先"],
+        "hint": (
+            "H.264 任何客户端都能播，是安全默认。H.265 同体积画质明显更好"
+            "（实测同码率 VMAF 高约 15 分），但 Windows 10 不自带 HEVC 解码"
+            "（需商店付费扩展）、安卓中低端机只保证 H.264 硬解，"
+            "发出去对方可能放不出来或黑屏。确认接收端都能播 H.265 再开"
+        ),
     },
     {
         "key": "SEND_ERROR_MESSAGES",
@@ -1417,6 +1431,18 @@ class ParserConfig:
         不需要重启也不需要热更新钩子。
         """
         return max(0, int(self._cfg_get("DOUYIN_COMPRESS_SIZE_MB", 30)))
+
+    @property
+    def DOUYIN_COMPRESS_CODEC(self) -> str:
+        """抖音视频压缩编码偏好。
+
+        与 BILI_CODEC 一样在读侧兜白名单：配置可能被手改或从旧版本带过来脏值，
+        静默回退到兼容默认，而不是把认不出的值透给 ffmpeg。
+        """
+        value = str(self._cfg_get("DOUYIN_COMPRESS_CODEC", "H.264 兼容优先") or "").strip()
+        if value in ("H.264 兼容优先", "H.265 画质优先"):
+            return value
+        return "H.264 兼容优先"
 
     @property
     def PROXY(self) -> str:

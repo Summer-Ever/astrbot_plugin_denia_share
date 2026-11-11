@@ -73,13 +73,17 @@ class DouyinParser(BaseParser):
             from ...config import get_config
             from ...media_utils import compress_video_if_needed
 
-            threshold = get_config().DOUYIN_COMPRESS_SIZE_MB
+            config = get_config()
+            threshold = config.DOUYIN_COMPRESS_SIZE_MB
+            codec = (
+                "h265" if config.DOUYIN_COMPRESS_CODEC == "H.265 画质优先" else "h264"
+            )
         except Exception:
-            logger.debug("[douyin] 读取压缩阈值失败，跳过压缩", exc_info=True)
+            logger.debug("[douyin] 读取压缩配置失败，跳过压缩", exc_info=True)
             return path
         if threshold <= 0:
             return path
-        return await compress_video_if_needed(path, threshold)
+        return await compress_video_if_needed(path, threshold, codec=codec)
 
     # ------------------------------------------------------------------ #
     # URL 注册

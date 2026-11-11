@@ -35,10 +35,18 @@
         "type": "int",
         "default": 30,
         "invisible": true,
-        "hint": "抖音视频超过该体积时，发送前用 ffmpeg 压到 720p（音频不重编码，尽量保留音质），避免文件过大发送失败。0 = 关闭压缩。需要本机安装 ffmpeg",
+        "hint": "抖音视频超过该体积时，发送前用 ffmpeg 压缩，避免文件过大发送失败。画质优先：先试着守住 720p 定质量压，确实压不进阈值才按码率预算降档。限帧 30fps，音频不重编码。0 = 关闭压缩。需要本机安装 ffmpeg",
         "min": 0,
         "max": 4096,
         "unit": "MB"
+      },
+      "DOUYIN_COMPRESS_CODEC": {
+        "description": "抖音视频压缩编码",
+        "type": "string",
+        "default": "H.264 兼容优先",
+        "invisible": true,
+        "options": ["H.264 兼容优先", "H.265 画质优先"],
+        "hint": "H.264 任何客户端都能播，是安全默认。H.265 同体积画质明显更好，但 Windows 10 不自带 HEVC 解码、安卓中低端机只保证 H.264 硬解，发出去对方可能放不出来。确认接收端都能播再开"
       },
       "SEND_ERROR_MESSAGES": {
         "description": "解析失败时发送错误提示",

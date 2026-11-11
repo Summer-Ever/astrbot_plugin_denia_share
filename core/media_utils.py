@@ -7,11 +7,13 @@
 import os
 import re
 import json
+import math
 import asyncio
 import hashlib
 import shutil
 import time
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urljoin, urlparse
 
 from astrbot.api import logger
@@ -483,18 +485,78 @@ _MIN_VIDEO_BPS = 60_000
 # 无时长信息时退回的 CRF 档位（探测失败才会用到）。
 _COMPRESS_CRF_STEPS = (25, 30)
 
+# ---- 定质量优先（内容自适应）----
+# 实测（真实抖音 720p30 内容，锁同一码率 597k，VMAF 对原片逐帧算）：
+#   veryfast 39.08 / medium 43.92 / slow 46.75 / x265-medium 61.46
+# 同体积下 preset 就是最大的画质杠杆，slow 比 veryfast 高 7.7 分而只慢 2.4 倍。
+# x265 再高 15 分，但 Win10 不带 HEVC 解码、安卓中低端只保 H.264 硬解，
+# 发出去可能根本放不出来 —— 所以默认仍是 H.264，H.265 交给用户显式开启。
+_COMPRESS_PRESET = "slow"
+_COMPRESS_CRF = 23
 
-def _scale_filter(short_side: int) -> str:
+# 抖音大量 60fps 源，限到 30fps 能省近四成运动码率。**只在源帧率高于 30 时加**：
+# 对 24fps 的片子套 fps=30 会插重复帧，白花码率还劣化画质。
+_COMPRESS_FPS = 30
+
+# 轻去噪近乎白送（实测 +0.8 VMAF，耗时几乎不变）。nlmeans 慢 4~5 倍，不用。
+_COMPRESS_DENOISE = "hqdn3d"
+
+# 抽样估算：在 20%/50%/80% 处各取 6 秒试压，按秒外推全片体积。
+# 这是 B站 per-shot 定质量转码 / ab-av1 crf-search 的工程简化版 ——
+# 用几秒钱的探针判断「这片子定质量压能不能达标」，避免为难压内容白转一整遍。
+_SAMPLE_SECONDS = 6.0
+_SAMPLE_POINTS = (0.2, 0.5, 0.8)
+# 外推安全系数：抽样点未必覆盖最复杂的段落，估宽一点免得整片压完才发现超标。
+_SAMPLE_MARGIN = 1.15
+
+# CRF 每升高这么多，体积约减半。**这是实测拟合值，不是流传的「+6 减半」**：
+# 真实抖音内容 crf23->26 体积 ×0.807、crf23->28 ×0.693，反推 k≈9.5。
+# 取 9 略偏激进，所以算出的 CRF 还要再抽一次样验证，估不准就退回预算兜底。
+_CRF_HALVING = 9.0
+# CRF 上限：再高画面就开始明显糊了，宁可交给预算兜底去降分辨率。
+_CRF_MAX = 34
+
+
+def _crf_for_target(est_bytes: int, target_bytes: int, base_crf: int) -> int:
+    """由「base_crf 的估算体积」反推「压进 target_bytes 需要的 CRF」。
+
+    守 720p 抬 CRF 通常比降分辨率划算得多：实测 1200s 近静态素材，
+    360p/69k 只有 VMAF 57.98，而 720p 定质量能到 96.71。
+    """
+    if est_bytes <= target_bytes or target_bytes <= 0:
+        return base_crf
+    delta = _CRF_HALVING * math.log2(est_bytes / target_bytes)
+    return min(_CRF_MAX, base_crf + int(math.ceil(delta)))
+
+
+def _scale_filter(short_side: int, flags: str = "lanczos") -> str:
     """短边压到 ≤short_side，**只缩不放**。
 
     横屏（iw>ih）短边是高，竖屏短边是宽 —— 抖音常见的 1080x1920 会压成
     720x1280，而不是把宽压到 720 却把高留成 1920。floor(.../2)*2 保证偶数，
     libx264 的 yuv420p 不接受奇数边长。
+
+    降采样用 lanczos：比默认 bicubic 保留更多细节，且只在真的要缩时才生效
+    （源就是 720p 时整个 scale 是空操作，flags 无影响）。
     """
     return (
         f"scale='if(gt(iw,ih),-2,floor(min({short_side},iw)/2)*2)':"
-        f"'if(gt(iw,ih),floor(min({short_side},ih)/2)*2,-2)'"
+        f"'if(gt(iw,ih),floor(min({short_side},ih)/2)*2,-2)':flags={flags}"
     )
+
+
+def _video_filter(info: "_MediaInfo | None", short_side: int) -> str:
+    """拼视频滤镜链，顺序有讲究：fps → 去噪 → 缩放。
+
+    fps 放最前：先砍掉一半帧，后面的去噪和缩放就只处理一半的像素量。
+    去噪放在缩放前：噪点在原分辨率上更好分辨，缩完再去噪会糊掉细节。
+    """
+    parts: list[str] = []
+    if info is not None and info.fps > _COMPRESS_FPS + 0.5:
+        parts.append(f"fps={_COMPRESS_FPS}")
+    parts.append(_COMPRESS_DENOISE)
+    parts.append(_scale_filter(short_side))
+    return ",".join(parts)
 
 
 def _target_short_side(video_bps: int) -> int:
@@ -510,17 +572,43 @@ def _target_short_side(video_bps: int) -> int:
     return 360
 
 
-async def _probe_media(path: Path) -> tuple[float, int] | None:
-    """探测 (时长秒, 音频码率 bps)。拿不到时长就返回 None。
+class _MediaInfo(NamedTuple):
+    duration: float
+    audio_bps: int
+    fps: float
+    width: int
+    height: int
+
+
+def _parse_fps(*raw: object) -> float:
+    """ffprobe 的帧率是 "30/1" / "60000/1001" 这种分数字符串，"0/0" 表示未知。"""
+    for value in raw:
+        if not isinstance(value, str) or "/" not in value:
+            continue
+        num, _, den = value.partition("/")
+        try:
+            n, d = float(num), float(den)
+        except ValueError:
+            continue
+        if d > 0 and n > 0:
+            return n / d
+    return 0.0
+
+
+async def _probe_media(path: Path) -> _MediaInfo | None:
+    """探测时长 / 音频码率 / 帧率 / 分辨率。拿不到时长就返回 None。
 
     时长是**按体积反推码率**的唯一依据，没有它就只能退回 CRF 档位（而 CRF
-    不保证体积上限）。ffprobe 与 ffmpeg 同包发行，缺失属于少数环境。
+    不保证体积上限）。帧率决定要不要限到 30fps，分辨率决定缩放是不是空操作。
+    ffprobe 与 ffmpeg 同包发行，缺失属于少数环境。
     """
     if shutil.which("ffprobe") is None:
         return None
     cmd = [
         "ffprobe", "-v", "error",
-        "-show_entries", "format=duration:stream=codec_type,bit_rate",
+        "-show_entries",
+        "format=duration:stream=codec_type,bit_rate,width,height,"
+        "r_frame_rate,avg_frame_rate",
         "-of", "json", str(path),
     ]
     try:
@@ -544,15 +632,39 @@ async def _probe_media(path: Path) -> tuple[float, int] | None:
     if duration <= 0:
         return None
     audio_bps = 0
+    fps = width = height = 0
     for stream in info.get("streams") or []:
-        if stream.get("codec_type") != "audio":
-            continue
-        try:
-            audio_bps = int(stream.get("bit_rate") or 0)
-        except (TypeError, ValueError):
-            audio_bps = 0
-        break
-    return duration, audio_bps or _DEFAULT_AUDIO_BPS
+        kind = stream.get("codec_type")
+        if kind == "audio" and not audio_bps:
+            try:
+                audio_bps = int(stream.get("bit_rate") or 0)
+            except (TypeError, ValueError):
+                audio_bps = 0
+        elif kind == "video" and not width:
+            fps = _parse_fps(stream.get("avg_frame_rate"), stream.get("r_frame_rate"))
+            try:
+                width = int(stream.get("width") or 0)
+                height = int(stream.get("height") or 0)
+            except (TypeError, ValueError):
+                width = height = 0
+    return _MediaInfo(
+        duration=duration,
+        audio_bps=audio_bps or _DEFAULT_AUDIO_BPS,
+        fps=fps,
+        width=width,
+        height=height,
+    )
+
+
+def _encoder_args(codec: str) -> list[str]:
+    """编码器与前缀参数。preset 是最大的画质杠杆，见 _COMPRESS_PRESET 处的实测。
+
+    H.265 必须打 ``hvc1`` tag：默认的 ``hev1`` 在苹果系与不少播放器上直接黑屏。
+    """
+    if codec == "h265":
+        return ["-c:v", "libx265", "-preset", "medium", "-tag:v", "hvc1"]
+    return ["-c:v", "libx264", "-preset", _COMPRESS_PRESET,
+            "-profile:v", "high", "-pix_fmt", "yuv420p"]
 
 
 async def _compress_encode(
@@ -562,16 +674,25 @@ async def _compress_encode(
     vf: str,
     video_args: list[str],
     audio_args: list[str],
+    seek: float | None = None,
+    seconds: float | None = None,
 ) -> bool:
     """转码一遍，成功返回 True。失败清掉残缺输出再返回 False。
+
+    ``seek``/``seconds`` 供抽样探针用：``-ss`` 必须在 ``-i`` **之前**才是快速
+    关键帧定位，放后面会从头解码到该点，抽 3 段就等于把整片解 3 遍。
 
     残缺文件必须先清：它顶着 ``.part`` 名不会被当产物复用，但留着会白占磁盘。
     取消（CancelledError 不是 Exception 子类）原样上抛，不能吞。
     """
-    cmd = [
-        "ffmpeg", "-y", "-i", str(src),
+    cmd = ["ffmpeg", "-y"]
+    if seek is not None:
+        cmd += ["-ss", f"{seek:.3f}"]
+    cmd += ["-i", str(src)]
+    if seconds is not None:
+        cmd += ["-t", f"{seconds:.3f}"]
+    cmd += [
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast",
         *video_args,
         *audio_args,
         "-movflags", "+faststart",
@@ -588,18 +709,64 @@ async def _compress_encode(
     return True
 
 
-async def compress_video_if_needed(video_path: Path, threshold_mb: float) -> Path:
-    """体积超过阈值的视频压到 720p（libx264），**音频不重编码**以保留音质。
+async def _estimate_crf_bytes(
+    src: Path, info: _MediaInfo, vf: str, encoder: list[str], crf: int
+) -> int | None:
+    """抽 3 段试压，外推「定质量 CRF 压整片」的体积（含音轨）。探不了返回 None。
+
+    存在的意义：定质量模式体积完全由内容复杂度决定，静态图文视频可能几 MB
+    就够、实拍运动画面可能要上百 MB。不先探一下就只能二选一 —— 要么盲目整片
+    转一遍（难压内容白等几分钟），要么像旧实现那样按平均预算预判分辨率
+    （把本来能守 720p 的静态内容无谓砍到 360p）。几秒钱的探针换掉这个两难。
+    """
+    tmp = src.with_name(f"{src.stem}.probe.part.mp4")
+    sampled_secs = 0.0
+    sampled_bytes = 0
+    try:
+        for point in _SAMPLE_POINTS:
+            start = max(0.0, info.duration * point - _SAMPLE_SECONDS / 2)
+            seg = min(_SAMPLE_SECONDS, info.duration - start)
+            if seg < 1.0:
+                continue
+            if not await _compress_encode(
+                src, tmp, vf=vf,
+                video_args=[*encoder, "-crf", str(crf)],
+                audio_args=["-an"], seek=start, seconds=seg,
+            ):
+                return None
+            sampled_bytes += tmp.stat().st_size
+            sampled_secs += seg
+        if sampled_secs <= 0:
+            return None
+        video_bytes = sampled_bytes / sampled_secs * info.duration
+        audio_bytes = info.audio_bps * info.duration / 8
+        return int((video_bytes + audio_bytes) * _SAMPLE_MARGIN)
+    except OSError:
+        return None
+    finally:
+        await safe_unlink(tmp)
+
+
+async def compress_video_if_needed(
+    video_path: Path, threshold_mb: float, *, codec: str = "h264"
+) -> Path:
+    """体积超过阈值就压缩，**画质优先**：能定质量达标就不按码率硬砍。
 
     用途：抖音大视频直发 QQ 常因文件过大被协议端拒绝。阈值由调用方传入
     （配置 ``DOUYIN_COMPRESS_SIZE_MB``，0 = 不压缩）。
 
-    **为什么不能只降分辨率 + 定 CRF**：抖音大量视频本身就是 720p，缩分辨率
-    是空操作；而 CRF 是「定质量」模式，输出体积完全由内容复杂度决定，**没有
-    任何上限保证**。实测一条 142MB / 326s 的 1280x720 抖音原片，crf=25 压出来
-    是 173MB（比原片还大），crf=30 仍有 115MB —— 转码三分半钟，阈值 30MB 一点
-    没靠近。所以这里改成**按阈值和时长反推目标码率**，用 maxrate/bufsize 给
-    体积封顶，CRF 只作为质量上限（capped CRF）：内容简单时省码率，复杂时撞顶。
+    两阶段策略（抄 B站 per-shot 定质量转码的思路，见 ``_estimate_crf_bytes``）：
+
+    1. **定质量优先**：抽样估算 CRF 压整片的体积，估算达标就守 720p 定质量压。
+       静态/图文/录屏类内容在这里就能压到几 MB 且画质近乎无损，分辨率一点不丢。
+    2. **预算兜底**：估算超标（实拍运动画面）才按「阈值 ÷ 时长」反推码率，用
+       maxrate/bufsize 封顶。CRF 只作质量上限（capped CRF）。
+
+    **为什么不能只用其中一种**：CRF 是定质量模式，体积完全由内容复杂度决定，
+    **没有任何上限保证** —— 实测一条 142MB / 326s 的 1280x720 抖音原片，
+    crf=25 压出来 173MB（比原片还大），crf=30 仍有 115MB。反过来只按平均预算
+    预判分辨率也不行：1200s 的静态视频会被摊成 69k 码率 / 360p，而它其实
+    定质量守 720p 只要几 MB。**分辨率必须由内容难度决定，不是由时长平均值决定。**
 
     设计要点：
 
@@ -612,6 +779,9 @@ async def compress_video_if_needed(video_path: Path, threshold_mb: float) -> Pat
     - **音频**：``-c:a copy`` 直接复制音频流（抖音音轨是 AAC，MP4 容器装得下），
       音质零损失；个别编码装不进 MP4 时退回 AAC 192k 重编码，仍属高质量。
       音频码率会从总预算里先扣掉，剩下的才分给视频。
+    - **codec**：默认 ``h264``（QQ 各端都能播）。``h265`` 同体积画质高约 15 VMAF，
+      但 Win10 不自带 HEVC 解码、安卓中低端只保 H.264 硬解，可能放不出来，
+      所以只在用户显式开启时才用。
 
     Returns:
         压缩产物的路径，或（未压缩/压缩失败/产物更大时的）原路径。
@@ -678,52 +848,88 @@ async def compress_video_if_needed(video_path: Path, threshold_mb: float) -> Pat
 
         # 音频默认原流复制（音质零损失）；个别编码装不进 MP4 时退回 AAC 192k。
         copy_audio = [["-c:a", "copy"], ["-c:a", "aac", "-b:a", "192k"]]
+        encoder = _encoder_args(codec)
 
         if probe is not None:
-            duration, audio_bps = probe
-            total_bps = int(target_bytes * 8 / duration)
-            # 音频能原流复制就复制（音质零损失）—— 判据是「扣掉整条音轨后，
-            # 剩下的预算还够不够撑起一段能看的视频」。只有长视频把预算摊到
-            # 连音轨都装不下时，才按比例给音频封顶并降码率重编码。
-            if total_bps - audio_bps >= _MIN_VIDEO_BPS:
-                audio_target = audio_bps
-                audio_variants = copy_audio
-                audio_note = f"{audio_bps // 1000}k 原流复制"
-            else:
-                audio_target = min(
-                    audio_bps, max(int(total_bps * _AUDIO_BUDGET_RATIO), _MIN_AUDIO_BPS)
-                )
-                audio_variants = [["-c:a", "aac", "-b:a", str(audio_target)]]
-                audio_note = (
-                    f"{audio_bps // 1000}k -> {audio_target // 1000}k 重编码（预算不足）"
-                )
-            video_bps = max(total_bps - audio_target, _MIN_VIDEO_BPS)
-            logger.info(
-                f"[denia_share] 压缩预算: 时长 {duration:.0f}s / 音频 {audio_note} "
-                f"/ 视频 {video_bps // 1000}k / 短边 {_target_short_side(video_bps)}"
+            # ---- 阶段1：定质量优先，守 720p，靠抬 CRF 而不是降分辨率达标 ----
+            vf720 = _video_filter(probe, 720)
+            settled = False
+            est = await _estimate_crf_bytes(
+                video_path, probe, vf720, encoder, _COMPRESS_CRF
             )
-            # 第一档：capped CRF —— 质量优先，但 maxrate 给体积封顶。
-            size = await run(
-                _scale_filter(_target_short_side(video_bps)),
-                ["-crf", "23", "-maxrate", str(video_bps),
-                 "-bufsize", str(video_bps * 2)],
-                "abr", audio_variants,
-            )
-            if size is not None and size > limit_bytes:
-                # 单遍 ABR 有过冲：按实测比例收紧预算再来一遍纯 ABR。
-                tightened = max(
-                    int(video_bps * target_bytes / size * 0.95), _MIN_VIDEO_BPS
-                )
+            crf = _COMPRESS_CRF
+            if est is not None:
+                crf = _crf_for_target(est, target_bytes, _COMPRESS_CRF)
+                if crf != _COMPRESS_CRF:
+                    # 抬过 CRF 必须重探一次：拟合曲线只是估算，估不准宁可退回
+                    # 兜底，也不要整片压完才发现超标 —— 那才是真的白等几分钟。
+                    est = await _estimate_crf_bytes(
+                        video_path, probe, vf720, encoder, crf
+                    )
+            if est is not None and est <= target_bytes:
                 logger.info(
-                    f"[denia_share] 首档 {size / 1048576:.1f}MB 仍超阈值，"
-                    f"收紧视频码率到 {tightened // 1000}k 重压"
+                    f"[denia_share] 抽样估算 crf{crf} 约 {est / 1048576:.1f}MB "
+                    f"可达标，守 720p 定质量压缩: {video_path.name}"
                 )
-                await run(
-                    _scale_filter(_target_short_side(tightened)),
-                    ["-b:v", str(tightened), "-maxrate", str(tightened),
-                     "-bufsize", str(tightened * 2)],
-                    "abr2", audio_variants,
+                size = await run(
+                    vf720, [*encoder, "-crf", str(crf)], f"crf{crf}", copy_audio
                 )
+                settled = size is not None and size <= limit_bytes
+            elif est is not None:
+                logger.info(
+                    f"[denia_share] 抽样估算 crf{crf} 约 {est / 1048576:.1f}MB "
+                    f"仍超阈值，改按码率预算压缩: {video_path.name}"
+                )
+
+            # ---- 阶段2：预算兜底，只有内容确实难压时才走 ----
+            if not settled:
+                duration, audio_bps = probe.duration, probe.audio_bps
+                total_bps = int(target_bytes * 8 / duration)
+                # 音频能原流复制就复制（音质零损失）—— 判据是「扣掉整条音轨后，
+                # 剩下的预算还够不够撑起一段能看的视频」。只有长视频把预算摊到
+                # 连音轨都装不下时，才按比例给音频封顶并降码率重编码。
+                if total_bps - audio_bps >= _MIN_VIDEO_BPS:
+                    audio_target = audio_bps
+                    audio_variants = copy_audio
+                    audio_note = f"{audio_bps // 1000}k 原流复制"
+                else:
+                    audio_target = min(
+                        audio_bps,
+                        max(int(total_bps * _AUDIO_BUDGET_RATIO), _MIN_AUDIO_BPS),
+                    )
+                    audio_variants = [["-c:a", "aac", "-b:a", str(audio_target)]]
+                    audio_note = (
+                        f"{audio_bps // 1000}k -> {audio_target // 1000}k "
+                        f"重编码（预算不足）"
+                    )
+                video_bps = max(total_bps - audio_target, _MIN_VIDEO_BPS)
+                logger.info(
+                    f"[denia_share] 压缩预算: 时长 {duration:.0f}s / 音频 {audio_note} "
+                    f"/ 视频 {video_bps // 1000}k "
+                    f"/ 短边 {_target_short_side(video_bps)}"
+                )
+                # capped CRF —— 质量优先，但 maxrate 给体积封顶。
+                size = await run(
+                    _video_filter(probe, _target_short_side(video_bps)),
+                    [*encoder, "-crf", str(_COMPRESS_CRF),
+                     "-maxrate", str(video_bps), "-bufsize", str(video_bps * 2)],
+                    "abr", audio_variants,
+                )
+                if size is not None and size > limit_bytes:
+                    # 单遍 ABR 有过冲：按实测比例收紧预算再来一遍纯 ABR。
+                    tightened = max(
+                        int(video_bps * target_bytes / size * 0.95), _MIN_VIDEO_BPS
+                    )
+                    logger.info(
+                        f"[denia_share] 首档 {size / 1048576:.1f}MB 仍超阈值，"
+                        f"收紧视频码率到 {tightened // 1000}k 重压"
+                    )
+                    await run(
+                        _video_filter(probe, _target_short_side(tightened)),
+                        [*encoder, "-b:v", str(tightened),
+                         "-maxrate", str(tightened), "-bufsize", str(tightened * 2)],
+                        "abr2", audio_variants,
+                    )
         else:
             # 探测不到时长就没有码率依据，退回 CRF 档位（不保证体积上限）。
             logger.info(
@@ -731,7 +937,8 @@ async def compress_video_if_needed(video_path: Path, threshold_mb: float) -> Pat
             )
             for crf in _COMPRESS_CRF_STEPS:
                 size = await run(
-                    _scale_filter(720), ["-crf", str(crf)], f"crf{crf}", copy_audio
+                    _video_filter(None, 720), [*encoder, "-crf", str(crf)],
+                    f"crf{crf}", copy_audio,
                 )
                 if size is not None and size <= limit_bytes:
                     break
