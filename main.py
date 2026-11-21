@@ -59,7 +59,7 @@ from .core.exception import (
     ParseException, IgnoreException, SilentException,
 )
 from .core.card_renderer import ShareCardRenderer
-from .core.card_links import card_summary, extract_links, has_card
+from .core.card_links import card_summary, extract_links, has_card, is_bilibili_card
 from .core.card_text import card_of as card_text_of
 from .core.screenshot import (
     ScreenshotService,
@@ -878,8 +878,12 @@ class DeniaSharePlugin(Star):
 
     @filter.regex(r".*")
     async def json_card_handler(self, event: AstrMessageEvent, matched: re.Match | None = None):
-        """QQ 分享卡片（Json / Xml / Ark）里的链接解析"""
+        """B站分享卡片（Json / Xml / Ark）里的链接解析"""
         if not has_card(event):
+            return
+        # 只解析 B站卡片：合并转发 / 其它平台的卡片（抖音、快手、音乐卡片……）
+        # 都当成普通聊天，不在这里触发解析。
+        if not is_bilibili_card(event):
             return
         links = self._prioritize_card_links(self._extract_links_from_event(event))
         if not links:
@@ -888,15 +892,17 @@ class DeniaSharePlugin(Star):
             # 判断是没识别到卡片还是解析失败 —— 打一条日志，配合 /denia_card 定位。
             logger.info("[denia_share] 收到分享卡片但没有可用链接：\n%s", card_summary(event))
             return
+        parser = self.parsers.get("bilibili")
+        if parser is None:
+            return
         for link in links:
-            for parser in self.parsers.values():
-                try:
-                    parser.search_url(link)
-                    async for r in self._process_url(_EventUrlWrapper(event, link), parser):
-                        yield r
-                    return
-                except (SilentException, ParseException):
-                    continue
+            try:
+                parser.search_url(link)
+                async for r in self._process_url(_EventUrlWrapper(event, link), parser):
+                    yield r
+                return
+            except (SilentException, ParseException):
+                continue
 
     def _prioritize_card_links(self, links: list[str]) -> list[str]:
         """卡片里的链接排序：**能在本地认定视频身份的排前面**。
@@ -951,7 +957,10 @@ class DeniaSharePlugin(Star):
             return
         if not self._card_title_search:
             return
-        parser = self.parsers.get(card.platform) if card.platform else None
+        # 只处理 B站卡片：其它来源（抖音 / 网易云……）的卡片不按标题反查。
+        if card.platform != "bilibili":
+            return
+        parser = self.parsers.get("bilibili")
         finder = getattr(parser, "search_video_candidates", None)
         if parser is None or not callable(finder):
             logger.info(
@@ -2883,8 +2892,12 @@ class DeniaSharePlugin(Star):
         - 为什么还要求「抽得到链接」：卡片里没有链接时，让内置平台处理器继续
           处理同一条消息里的文本链接。以前「一句话 + 一张无链接卡片」两条路
           互让，谁都解析不出来。
+        - 为什么还要求「是 B站卡片」：合并转发与其它平台的卡片不该抢走整条消息，
+          消息里的普通文本链接仍由各自的平台处理器解析。
         """
         if not has_card(event):
+            return False
+        if not is_bilibili_card(event):
             return False
         return bool(self._extract_links_from_event(event))
 

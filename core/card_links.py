@@ -338,6 +338,49 @@ def _first_str(obj: Any, keys: Iterable[str]) -> str:
     return ""
 
 
+# B站分享卡片的链接域名。卡片的 ``app`` 字段（``com.tencent.structmsg`` /
+# ``com.tencent.miniapp_01``）是所有第三方分享卡片共用的，靠它分不出平台，
+# 所以用导航链接落在哪个域名来认领。
+_BILIBILI_LINK_RE = re.compile(
+    r"https?://(?:[A-Za-z0-9-]+\.)*(?:bilibili\.com|b23\.tv|bili2233\.cn)(?::\d+)?(?:[/?#]|$)",
+    re.I,
+)
+
+# 合并转发 / 聊天记录卡片：同样是 ``json`` 段、里面也可能带链接，但它不是
+# 「一条分享卡片」，绝不能被卡片解析器接手。
+_FORWARD_CARD_APPS: frozenset[str] = frozenset({"com.tencent.multimsg"})
+
+# 卡片自报来源里能认出 B站的写法。
+_BILIBILI_SOURCE_HINTS: tuple[str, ...] = ("哔哩哔哩", "bilibili", "b站")
+
+
+def is_bilibili_card(event: Any) -> bool:
+    """这条消息里的卡片是不是 **B站分享卡片**。
+
+    只认两种证据，任一成立即可：
+
+    - 卡片里的链接落在 B站域名（``bilibili.com`` / ``b23.tv`` / ``bili2233.cn``）；
+    - 卡片自报的来源（``tag`` / ``source``）写着哔哩哔哩。
+
+    合并转发（``com.tencent.multimsg``）以及其它平台的卡片一律返回 ``False``：
+    即使合并转发里裹着 B站链接，它是「聊天记录」而不是一条 B站卡片。
+    """
+    texts = (raw_message_text(event), getattr(event, "message_str", "") or "")
+    if any("com.tencent.multimsg" in text for text in texts if text):
+        return False
+    objects = _card_objects(event)
+    if not objects:
+        # post_format=string 时只有 CQ 码，没有可拆的段结构，只能看链接。
+        return any(_BILIBILI_LINK_RE.match(link) for link in extract_links(event))
+    app = _first_str(objects, ("app", "app_id", "appid")).lower()
+    if app in _FORWARD_CARD_APPS:
+        return False
+    if any(_BILIBILI_LINK_RE.match(link) for link in extract_links(event)):
+        return True
+    source = _first_str(objects, ("tag", "source", "sourcename", "source_name")).lower()
+    return any(hint in source for hint in _BILIBILI_SOURCE_HINTS)
+
+
 def card_summary(event: Any) -> str:
     """一张卡片的可读摘要，供日志与 ``/denia_card`` 排查用。
 
