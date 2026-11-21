@@ -45,7 +45,10 @@
         "type": "string",
         "default": "H.264 兼容优先",
         "invisible": true,
-        "options": ["H.264 兼容优先", "H.265 画质优先"],
+        "options": [
+          "H.264 兼容优先",
+          "H.265 画质优先"
+        ],
         "hint": "H.264 任何客户端都能播，是安全默认。H.265 同体积画质明显更好，但 Windows 10 不自带 HEVC 解码、安卓中低端机只保证 H.264 硬解，发出去对方可能放不出来。确认接收端都能播再开"
       },
       "SEND_ERROR_MESSAGES": {
@@ -400,7 +403,7 @@
       "OUTPUT_MODES_INITIALIZED": {
         "description": "输出模式迁移标记",
         "type": "bool",
-        "default": false,
+        "default": true,
         "invisible": true,
         "hint": "由插件维护，避免宿主补齐默认值后重复迁移用户选择。"
       }
@@ -413,7 +416,7 @@
       "RENDER_ENABLED": {
         "description": "启用卡片渲染",
         "type": "bool",
-        "default": true,
+        "default": false,
         "invisible": true,
         "hint": "仅控制卡片渲染。关闭后不发送卡片，不影响已选文本和富媒体。"
       },
@@ -628,14 +631,14 @@
       "MARKDOWN_IMAGE_ENABLED": {
         "description": "用 Markdown 集中展示图片",
         "type": "bool",
-        "default": false,
+        "default": true,
         "invisible": true,
         "hint": "开启后，图片数量达到下面的阈值时不再合并转发，而是把图片按 Markdown 语法集中成一条（或几条）消息展示。适用于 QQ 官方机器人这类不支持合并转发的协议端；图片本身必须带公网 URL（平台直链），本地文件无法用 Markdown 渲染。本项优先于「聚合方式」，关闭后行为与原来完全一致"
       },
       "MARKDOWN_IMAGE_THRESHOLD": {
         "description": "Markdown 图片阈值",
         "type": "int",
-        "default": 3,
+        "default": 2,
         "invisible": true,
         "hint": "图片数量达到该值就改用 Markdown 集中展示。0=这一项不触发（等于关闭）",
         "min": 0,
@@ -645,7 +648,7 @@
       "MARKDOWN_IMAGE_MAX_PER_MSG": {
         "description": "单条最大图片数",
         "type": "int",
-        "default": 10,
+        "default": 12,
         "invisible": true,
         "hint": "单条 Markdown 消息最多展示多少张图，超出时按顺序自动拆成多条，不重不漏",
         "min": 1,
@@ -665,9 +668,9 @@
       "MARKDOWN_IMAGE_WIDTH": {
         "description": "Markdown 图片宽度",
         "type": "int",
-        "default": 200,
+        "default": 60,
         "invisible": true,
-        "hint": "QQ 官方机器人要求 Markdown 图片写成 ![文字 #宽px #高px](链接)，缺了宽高 QQ 只显示成 [image] 链接文字、图片不出来。默认 200",
+        "hint": "QQ 官方机器人要求 Markdown 图片写成 ![文字 #宽px #高px](链接)，缺了宽高 QQ 只显示成 [image] 链接文字、图片不出来。默认 60",
         "min": 50,
         "max": 600,
         "unit": "px"
@@ -675,7 +678,7 @@
       "MARKDOWN_IMAGE_HEIGHT": {
         "description": "Markdown 图片高度",
         "type": "int",
-        "default": 200,
+        "default": 80,
         "invisible": true,
         "hint": "等比模式下这是「最大高度」：按原图比例算出的高度超过它就压宽度封顶，比例不变。固定模式则直接作为显示高度",
         "min": 50,

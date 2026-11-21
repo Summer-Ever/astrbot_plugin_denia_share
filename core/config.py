@@ -466,7 +466,7 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "group": "输出模式",
         "label": "输出模式迁移标记",
         "type": "bool",
-        "default": False,
+        "default": True,
         "internal": True,
         "hint": "由插件维护，避免宿主补齐默认值后重复迁移用户选择。",
     },
@@ -476,7 +476,7 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "subgroup": "基础",
         "label": "启用卡片渲染",
         "type": "bool",
-        "default": True,
+        "default": False,
         "hint": "仅控制卡片渲染。关闭后不发送卡片，不影响已选文本和富媒体。",
     },
     {
@@ -727,7 +727,7 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "group": "合并转发",
         "label": "用 Markdown 集中展示图片",
         "type": "bool",
-        "default": False,
+        "default": True,
         "hint": (
             "开启后，图片数量达到下面的阈值时不再合并转发，而是把图片按 "
             "Markdown 语法集中成一条（或几条）消息展示。"
@@ -741,7 +741,7 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "group": "合并转发",
         "label": "Markdown 图片阈值",
         "type": "int",
-        "default": 3,
+        "default": 2,
         "min": 0,
         "max": 99,
         "unit": "张",
@@ -752,7 +752,7 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "group": "合并转发",
         "label": "单条最大图片数",
         "type": "int",
-        "default": 10,
+        "default": 12,
         "min": 1,
         "max": 30,
         "unit": "张",
@@ -774,13 +774,13 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "group": "合并转发",
         "label": "Markdown 图片宽度",
         "type": "int",
-        "default": 200,
+        "default": 60,
         "min": 50,
         "max": 600,
         "unit": "px",
         "hint": (
             "QQ 官方机器人要求 Markdown 图片写成 ![文字 #宽px #高px](链接)，"
-            "缺了宽高 QQ 只显示成 [image] 链接文字、图片不出来。默认 200"
+            "缺了宽高 QQ 只显示成 [image] 链接文字、图片不出来。默认 60"
         ),
     },
     {
@@ -788,7 +788,7 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "group": "合并转发",
         "label": "Markdown 图片高度",
         "type": "int",
-        "default": 200,
+        "default": 80,
         "min": 50,
         "max": 600,
         "unit": "px",
