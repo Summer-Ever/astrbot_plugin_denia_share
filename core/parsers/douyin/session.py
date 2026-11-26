@@ -25,6 +25,7 @@ import base64
 import hashlib
 import json
 import re
+import time
 from http.cookies import SimpleCookie
 
 from httpx import AsyncClient
@@ -58,6 +59,16 @@ MAX_POW_ITER = 1_000_000
 # 12 次足够覆盖正常路径（冷请求拿 ttwid + 热请求拿数据，通常 2~3 次）。
 # 预算耗尽说明本机多半已经被限流，继续连发只会更糟 —— 那时应当把机会留给下一条消息。
 MAX_REQUESTS_PER_WORK = 12
+
+# 分享页会话（ttwid）的最大存活秒数，超时即整体换一份。
+#
+# cookie 是**跨消息**存活的，而 ttwid 有寿命。失效之后 fetch() 虽然有一条
+# 「清空 cookie、冷请求一次」的自愈路径，但那条路要花请求预算；预算若已被
+# 本条作品的前几个 URL 变体吃掉，自愈就走不动，只能干等插件重载 —— 表现为
+# 「抖音忽然解析失败，重载一下又好了」。给它一个年龄上限，让旧凭证在烂掉
+# 之前主动退场，比等它失效再去抢救省事得多。
+# 3600 = 一小时；想更频繁就调小。
+SESSION_MAX_AGE = 3600
 
 
 def _b64d(value: str) -> bytes:
@@ -136,6 +147,12 @@ class DouyinShareSession:
         self._lock = asyncio.Lock()
         # 单条作品的请求预算，由解析器在开始解析时重置（见 start_work）
         self._requests_left = MAX_REQUESTS_PER_WORK
+        # 会话创建时刻（单调时钟），供 expired() 判定
+        self._born = time.monotonic()
+
+    def expired(self) -> bool:
+        """会话年龄是否已越过 SESSION_MAX_AGE，该换一份新 cookie 了。"""
+        return time.monotonic() - self._born >= SESSION_MAX_AGE
 
     def start_work(self) -> None:
         """开始解析一条新作品：重置请求预算。
@@ -243,6 +260,11 @@ _SESSIONS: dict[type, DouyinShareSession] = {}
 def get_share_session(parser_cls) -> DouyinShareSession:
     """按解析器类缓存会话，让 cookie 跨消息存活。"""
     session = _SESSIONS.get(parser_cls)
+    if session is not None and session.expired():
+        # 旧会话只有 cookie，没有长连接（client 是每次 fetch 现开的），
+        # 直接丢掉即可，不需要关闭动作。
+        logger.debug("[douyin] 分享页会话已超时，重建并重新取得 ttwid")
+        session = None
     if session is None:
         session = DouyinShareSession(parser_cls.client_kwargs)
         _SESSIONS[parser_cls] = session

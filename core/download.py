@@ -33,6 +33,18 @@ from .exception import IgnoreException, DownloadException, MediaSizeExceeded
 # 而下载器也走 trust_env。详见 core/http_env.py。
 from . import http_env  # noqa: F401  (import for side effect)
 
+# 媒体下载的重试策略：连接被掐断时，最多试几次、每次隔多久。
+#
+# 为什么要重试：抖音/微博这类 CDN 的失败常常是**间歇性**的，不是凭证问题。
+# 实测同一条 URL、同一套请求头，几十秒内会从「必失败」变成「十次全过」；
+# 换不换 Referer、换不换 UA 都不构成因果。这种故障里，重试就是最有效的药。
+#
+# 为什么必须留退避：连发太快会把自己打进对方的限流页（见 douyin/session.py
+# 里 MAX_REQUESTS_PER_WORK 的说明），那是比失败更糟的局面 —— 一旦进去，
+# 之后怎么重试都没用。0.5s / 1.5s 是「够换个边缘节点、又不至于像压测」的量。
+MEDIA_RETRY_ATTEMPTS = 3
+MEDIA_RETRY_BACKOFF: tuple[float, ...] = (0.5, 1.5)
+
 # 图片并发上限。
 #
 # 远端返回的图集长度不受控（微博长文、抖音图文、NGA 帖），而每个条目都会立刻
@@ -70,6 +82,30 @@ MAX_M3U8_SEGMENTS = 3000
 # 单条媒体的硬上限为 2GB，单张图片为 64MB，避免异常下载耗尽磁盘。
 HARD_MAX_MEDIA_BYTES = 2 * 1024 * 1024 * 1024  # 视频 / 音频 2GB
 HARD_MAX_IMAGE_BYTES = 64 * 1024 * 1024  # 图片 64MB
+
+
+def _is_stale_connection_error(error: Exception) -> bool:
+    """是不是「连接已被对端关掉」这一类错误。
+
+    `RemoteProtocolError("Server disconnected without sending a response")`
+    是最典型的症状：连接池里那根 keep-alive 连接服务端早就关了，httpx 却还
+    拿它去发请求。`ReadError` / `WriteError` / `ConnectError` /
+    `ProtocolError` 同理 —— 这类错误只说明**这一根连接**死了，同一条 URL
+    换根新连接往往一次就过，不该直接判死、也不该立刻降级到 curl_cffi
+    （那是另一套 TLS 指纹栈，代价高得多）。
+
+    特意**不含**超时类错误：大文件本来就慢，超时重试容易把带宽白白烧掉。
+    """
+    return isinstance(
+        error,
+        (
+            httpx.RemoteProtocolError,
+            httpx.ProtocolError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.ConnectError,
+        ),
+    )
 
 
 class StreamDownloader:
@@ -246,7 +282,7 @@ class StreamDownloader:
         )
         raise DownloadException(f"媒体响应不是有效内容：{reason}")
 
-    async def _download_file_with_httpx(
+    async def _download_httpx_with_retries(
         self,
         url: str,
         *,
@@ -255,10 +291,66 @@ class StreamDownloader:
         max_bytes: int | None = None,
         chunk_size: int = 64 * 1024,
     ) -> Path:
+        """httpx 下载 + 退避重试。
+
+        第一次用共享连接池；之后的每次都用**全新的一次性连接池**，而不是原地
+        重试 —— 原地的池子里躺着的那根连接本来就是坏的，复用它只会再失败一次。
+
+        只有连接层错误（被对端掐断）才重试；4xx/5xx、证书错误重试没有意义，
+        立刻抛出去交给 curl_cffi 兜底。
+        """
+        last_error: httpx.HTTPError | None = None
+        for attempt in range(MEDIA_RETRY_ATTEMPTS):
+            client = None if attempt == 0 else self._new_client(self.proxies)
+            try:
+                return await self._download_file_with_httpx(
+                    url,
+                    file_path=file_path,
+                    headers=headers,
+                    max_bytes=max_bytes,
+                    chunk_size=chunk_size,
+                    client=client,
+                )
+            except httpx.HTTPError as error:
+                last_error = error
+                if not _is_stale_connection_error(error):
+                    raise
+                if attempt + 1 >= MEDIA_RETRY_ATTEMPTS:
+                    raise
+                delay = MEDIA_RETRY_BACKOFF[min(attempt, len(MEDIA_RETRY_BACKOFF) - 1)]
+                logger.debug(
+                    f"下载连接被掐断（{type(error).__name__}: {error}），"
+                    f"{delay:.1f}s 后换新连接重试"
+                    f"（第 {attempt + 2}/{MEDIA_RETRY_ATTEMPTS} 次）| url: {url}"
+                )
+                await asyncio.sleep(delay)
+            finally:
+                if client is not None:
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        logger.debug("关闭重试连接池失败", exc_info=True)
+        # 循环正常退出只可能是 MEDIA_RETRY_ATTEMPTS <= 0；留个兜底，别返回 None
+        raise last_error or DownloadException("媒体下载失败")
+
+    async def _download_file_with_httpx(
+        self,
+        url: str,
+        *,
+        file_path: Path,
+        headers: dict[str, str],
+        max_bytes: int | None = None,
+        chunk_size: int = 64 * 1024,
+        client: httpx.AsyncClient | None = None,
+    ) -> Path:
         part = self._part_path(file_path)
         # 不传就是媒体上限；图片由 download_img 显式传图片上限（见 _image_max_bytes）
         limit = self._max_bytes if max_bytes is None else max_bytes
-        async with self.client.stream("GET", url, headers=headers, follow_redirects=True) as response:
+        # client 参数供「连接已死、换池重试」的路径传入一次性客户端；
+        # 默认走共享连接池。
+        async with (client or self.client).stream(
+            "GET", url, headers=headers, follow_redirects=True
+        ) as response:
             response.raise_for_status()
             self._validate_content_length(response, limit)
             received_bytes = 0
@@ -411,11 +503,15 @@ class StreamDownloader:
             if file_path.exists():
                 return self._cached_within_limit(file_path, limit)
             try:
-                return await self._download_file_with_httpx(
+                return await self._download_httpx_with_retries(
                     url, file_path=file_path, headers=headers,
                     max_bytes=limit, chunk_size=chunk_size,
                 )
-            except httpx.HTTPError as primary_error:
+            except IgnoreException:
+                # 「体积超限」这类策略跳过不是下载失败，绝不能被下面的兜底
+                # 抹成 DownloadException —— 缺料审计正是靠异常类型区分的。
+                raise
+            except Exception as primary_error:
                 from .config import get_config
                 try:
                     return await self._download_file_with_curl_cffi(

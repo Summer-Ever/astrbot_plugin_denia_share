@@ -27,6 +27,7 @@ from ...data import Platform, platform_of
 from ...task import PathTask
 from .models.video import unwrap_audio_url
 from ...media_utils import fmt_duration
+from ...exception import DownloadException
 
 
 class DouyinParser(BaseParser):
@@ -62,13 +63,49 @@ class DouyinParser(BaseParser):
             url_or_task, cover_url=cover_url, duration=duration, is_gif=is_gif
         )
 
+    async def _download_with_line_fallback(self, url: str) -> Path:
+        """下载抖音直链；主线路被掐断时换一条 line 再试一次。
+
+        `aweme/v1/play` 的 `line` 参数指向不同的分发线路。同一条作品在
+        line=0 上被掐连接、换一条就正常的情况是实测见过的 —— 那类失败属于
+        边缘节点或短时处置，不是凭证问题（下载请求本身不带任何 cookie）。
+
+        只对 play 直链做改写：图集、音频、m3u8 的 URL 没有这个概念，原样交给
+        下载器，绝不凭空拼参数。
+        """
+        try:
+            return await self.downloader.download_video(url, ext_headers=self.headers)
+        except DownloadException:
+            swapped = self._swap_play_line(url)
+            if swapped is None:
+                raise
+            alt_url, alt_label = swapped
+            logger.info(
+                f"[douyin] 主线路下载失败，改走 {alt_label} 重试 | {url[:120]}"
+            )
+            return await self.downloader.download_video(alt_url, ext_headers=self.headers)
+
+    @staticmethod
+    def _swap_play_line(url: str) -> tuple[str, str] | None:
+        """把 play 直链的 line 换成另一条；不是 play 直链就返回 None。"""
+        if 'aweme/v1/play' not in url:
+            return None
+        match = re.search(r'([?&])line=(\d+)', url)
+        if match is None:
+            return None
+        new_line = '0' if match.group(2) != '0' else '1'
+        alt_url = re.sub(r'([?&])line=\d+', lambda m: f'{m.group(1)}line={new_line}', url, count=1)
+        if alt_url == url:
+            return None
+        return alt_url, f'line={new_line}'
+
     async def _download_and_compress(self, url: str) -> Path:
         """下载抖音视频，然后按当前配置决定是否压缩。
 
         配置读取包在 try 里：解析器其余部分不依赖任何配置项，这里同样不能让
         「配置不可用」把整条视频下载炸掉 —— 读不到就当关闭压缩。
         """
-        path = await self.downloader.download_video(url, ext_headers=self.headers)
+        path = await self._download_with_line_fallback(url)
         try:
             from ...config import get_config
             from ...media_utils import compress_video_if_needed
